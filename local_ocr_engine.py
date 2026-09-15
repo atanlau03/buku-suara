@@ -562,6 +562,34 @@ def extract_last_numbers(
 # ============================================================
 
 def extract_closing_vote_data(text):
+    """
+    PERBAIKAN PENTING:
+
+    Formulir KPU untuk desa dengan TPS banyak (biasanya > 15) memecah
+    tabel SUARA SAH / SUARA TIDAK SAH / TOTAL menjadi DUA bagian pada
+    halaman yang sama:
+
+        Tabel 1 (TPS 001-015) -> diakhiri kolom "JUMLAH PINDAHAN"
+        Tabel 2 (TPS 016-dst) -> diakhiri kolom "JUMLAH AKHIR"
+
+    Versi lama fungsi ini mengambil KEMUNCULAN PERTAMA dari setiap baris
+    label (SAH / TIDAK SAH / TOTAL), yang berarti ia salah mengambil
+    angka "JUMLAH PINDAHAN" (tabel 1) sebagai hasil akhir, padahal angka
+    yang benar ada di "JUMLAH AKHIR" pada tabel 2.
+
+    Versi ini mencari SEMUA kemunculan setiap baris label, lalu:
+      - Kemunculan PERTAMA -> angka terakhirnya adalah "Jumlah Pindahan"
+        (BUKAN nilai final), sisanya adalah suara per-TPS awal.
+      - Kemunculan TERAKHIR -> angka PERTAMA adalah pindahan yang diulang
+        (dibuang), angka PALING TERAKHIR adalah "Jumlah Akhir" yang benar.
+      - Kalau cuma ADA SATU kemunculan (desa dengan TPS sedikit, tidak
+        perlu tabel pindahan), berperilaku seperti sebelumnya: angka
+        terakhir langsung dianggap nilai final.
+
+    Semua nilai per-TPS dari tabel 1 dan tabel 2 digabung supaya
+    breakdown per-TPS tetap lengkap sepanjang jumlah TPS desa tsb.
+    """
+
     lines = [
         x.strip()
         for x in normalize_text(text).splitlines()
@@ -589,152 +617,179 @@ def extract_closing_vote_data(text):
     if count == 0:
         return empty
 
-    def find_row(patterns):
-        for i, line in enumerate(lines):
-            u = line.upper()
+    # --------------------------------------------------------
+    # Predikat baris. PENTING: baris C ("...SAH DAN TIDAK SAH")
+    # secara substring JUGA mengandung teks baris A ("...SUARA SAH"),
+    # jadi baris A harus secara eksplisit MENOLAK baris yang
+    # mengandung "TIDAK SAH" supaya tidak tertukar dengan baris C.
+    # --------------------------------------------------------
 
-            if any(
-                p in u
-                for p in patterns
-            ):
-                return i
+    def is_row_a(u):
+        return (
+            "JUMLAH SELURUH SUARA SAH" in u
+            and "TIDAK SAH" not in u
+        )
 
-        return None
+    def is_row_b(u):
+        return "JUMLAH SUARA TIDAK SAH" in u
 
-    sah_i = find_row(
-        [
-            "JUMLAH SELURUH SUARA SAH"
+    def is_row_c(u):
+        return (
+            "JUMLAH SELURUH SUARA SAH DAN TIDAK SAH" in u
+            or "JUMLAH SELURUH SUARA SAH DAN SUARA TIDAK SAH" in u
+        )
+
+    def occurrences_of(predicate):
+        return [
+            i
+            for i, line in enumerate(lines)
+            if predicate(line.upper())
         ]
+
+    sah_occurrences = occurrences_of(is_row_a)
+    invalid_occurrences = occurrences_of(is_row_b)
+    total_occurrences = occurrences_of(is_row_c)
+
+    # Batas antar baris label -- dipakai supaya penggabungan baris
+    # lanjutan (untuk kasus OCR yang memecah satu baris jadi dua)
+    # tidak "memakan" baris label lain.
+    all_boundaries = (
+        set(sah_occurrences)
+        | set(invalid_occurrences)
+        | set(total_occurrences)
     )
 
-    invalid_i = find_row(
-        [
-            "JUMLAH SUARA TIDAK SAH"
-        ]
+    label_strip_pattern = (
+        r".*?(JUMLAH SELURUH SUARA SAH DAN SUARA TIDAK SAH"
+        r"|JUMLAH SELURUH SUARA SAH DAN TIDAK SAH"
+        r"|JUMLAH SUARA TIDAK SAH"
+        r"|JUMLAH SELURUH SUARA SAH)"
     )
 
-    total_i = find_row(
-        [
-            "JUMLAH SELURUH SUARA SAH DAN TIDAK SAH",
-            "JUMLAH SELURUH SUARA SAH DAN SUARA TIDAK SAH"
-        ]
-    )
+    def numbers_on_row(line_idx):
+        """
+        Ambil angka pada baris label. Jika baris tersebut tidak
+        menghasilkan angka sama sekali (kemungkinan OCR memecahnya jadi
+        baris terpisah), coba gabungkan dengan baris-baris berikutnya
+        yang murni berisi angka, sampai bertemu baris label lain.
+        """
 
-    row_starts = [
-        x
-        for x in [
-            sah_i,
-            invalid_i,
-            total_i
-        ]
-        if x is not None
-    ]
+        line = lines[line_idx]
 
-    def collect(
-        index,
-        stop_indices
-    ):
-        if index is None:
-            return [None] * count, None
+        cleaned = re.sub(
+            label_strip_pattern,
+            " ",
+            line,
+            flags=re.I,
+        )
 
-        nums = []
-
-        first = lines[index]
-
-        first = re.sub(
+        cleaned = re.sub(
             r"\([^)]*\)",
             " ",
-            first
+            cleaned,
         )
 
-        first = re.sub(
-            r".*?(JUMLAH SELURUH SUARA SAH DAN SUARA TIDAK SAH|JUMLAH SELURUH SUARA SAH DAN TIDAK SAH|JUMLAH SUARA TIDAK SAH|JUMLAH SELURUH SUARA SAH)",
-            " ",
-            first,
-            flags=re.I
-        )
+        nums = numbers_from_line(cleaned)
 
-        nums.extend(
-            numbers_from_line(first)
-        )
+        j = line_idx + 1
 
-        for j in range(
-            index + 1,
-            len(lines)
-        ):
-            if j in stop_indices:
-                break
+        while j < len(lines) and j not in all_boundaries:
 
-            line_nums = numbers_from_line(
-                lines[j]
-            )
+            candidate = lines[j].strip()
 
-            if line_nums:
+            if re.fullmatch(r"[\d.,\s]+", candidate):
                 nums.extend(
-                    line_nums
+                    numbers_from_line(candidate)
                 )
-
-            if len(nums) >= count + 1:
+                j += 1
+            else:
                 break
 
-        if len(nums) >= count + 1:
-            return (
-                nums[:count],
-                nums[count]
-            )
+        return nums
 
-        if len(nums) >= count:
-            return (
-                nums[:count],
-                None
-            )
+    def collect_final(occurrence_indices):
+        """
+        Gabungkan nilai per-TPS dari semua kemunculan baris label, dan
+        tentukan nilai FINAL dari kemunculan TERAKHIR (tabel "Jumlah
+        Akhir"), bukan kemunculan pertama (tabel "Jumlah Pindahan").
+        """
 
-        return (
-            [None] * count,
-            None
-        )
+        if not occurrence_indices:
+            return [], None
 
-    sah_values, sah_final = collect(
-        sah_i,
-        {
-            x
-            for x in row_starts
-            if x > (
-                sah_i
-                if sah_i is not None
-                else -1
-            )
-        }
+        per_tps_values = []
+        final_value = None
+
+        total_occ = len(occurrence_indices)
+
+        for pos, line_idx in enumerate(occurrence_indices):
+
+            nums = numbers_on_row(line_idx)
+
+            if not nums:
+                continue
+
+            is_first = (pos == 0)
+            is_last = (pos == total_occ - 1)
+
+            if is_first and is_last:
+                # Hanya satu kemunculan -> tidak ada tabel pindahan.
+                # Angka terakhir langsung menjadi nilai final.
+                per_tps_values.extend(nums[:-1])
+                final_value = nums[-1]
+
+            elif is_first:
+                # Tabel pertama (pindahan): buang angka terakhir
+                # (itu "Jumlah Pindahan", BUKAN nilai per-TPS/final).
+                per_tps_values.extend(nums[:-1])
+
+            elif is_last:
+                # Tabel terakhir (akhir): buang angka pertama
+                # (pindahan yang diulang). Angka paling akhir = final.
+                tail = nums[1:]
+
+                if tail:
+                    per_tps_values.extend(tail[:-1])
+                    final_value = tail[-1]
+
+            else:
+                # Tabel tengah (jika ada > 2 bagian): buang angka
+                # pertama (pindahan) dan terakhir (subtotal barunya).
+                per_tps_values.extend(nums[1:-1])
+
+        return per_tps_values, final_value
+
+    sah_values, sah_final = collect_final(
+        sah_occurrences
     )
 
-    invalid_values, invalid_final = collect(
-        invalid_i,
-        {
-            x
-            for x in row_starts
-            if x > (
-                invalid_i
-                if invalid_i is not None
-                else -1
-            )
-        }
+    invalid_values, invalid_final = collect_final(
+        invalid_occurrences
     )
 
-    total_values, total_final = collect(
-        total_i,
-        {
-            x
-            for x in row_starts
-            if x > (
-                total_i
-                if total_i is not None
-                else -1
-            )
-        }
+    total_values, total_final = collect_final(
+        total_occurrences
     )
+
+    def pad_to_count(values):
+        values = list(values)[:count]
+
+        while len(values) < count:
+            values.append(None)
+
+        return values
+
+    sah_values = pad_to_count(sah_values)
+    invalid_values = pad_to_count(invalid_values)
+    total_values = pad_to_count(total_values)
+
+    # --------------------------------------------------------
+    # Validasi matematika (tetap dipertahankan seperti versi lama)
+    # --------------------------------------------------------
 
     if (
         sah_final is None
+        and sah_values
         and all(
             v is not None
             for v in sah_values
@@ -746,6 +801,7 @@ def extract_closing_vote_data(text):
 
     if (
         invalid_final is None
+        and invalid_values
         and all(
             v is not None
             for v in invalid_values
@@ -902,217 +958,79 @@ def _numeric_token(token):
         return None
 
 
-def _ocr_variant(image, psm=6, scale=3, crop=None):
-    """OCR khusus tabel dengan pembesaran dan beberapa pilihan crop."""
-    try:
-        if crop is not None:
-            image = image.crop(crop)
-
-        if scale and scale != 1:
-            image = image.resize(
-                (int(image.width * scale), int(image.height * scale))
-            )
-
-        image = preprocess_image(image)
-
-        return pytesseract.image_to_string(
-            image,
-            lang=OCR_LANGUAGE,
-            config=f"--oem 3 --psm {psm}",
-        ) or ""
-    except Exception:
-        return ""
-
-
-def _extract_numbers_from_ocr_line(line):
-    """Ambil angka tabel dari satu baris OCR, termasuk 2.954 / 4,874."""
-    if not line:
-        return []
-
-    values = []
-    for token in re.findall(r"(?<![A-Z])\d[\d.,-]*", line.upper()):
-        token = token.strip(".,-")
-        if not token:
-            continue
-        n = _numeric_token(token)
-        if n is not None:
-            values.append(n)
-    return values
-
-
-def _find_final_section_text(text):
-    """Cari bagian JUMLAH AKHIR dan hanya gunakan baris setelahnya."""
-    if not text:
-        return ""
-
-    lines = [
-        normalize_text(x).strip()
-        for x in text.splitlines()
-        if normalize_text(x).strip()
-    ]
-
-    # Normalisasi OCR yang sering memisahkan J U M L A H / AKHIR.
-    normalized_lines = []
-    for line in lines:
-        upper = line.upper()
-        upper = re.sub(r"\s+", " ", upper)
-        normalized_lines.append((line, upper))
-
-    final_index = None
-    for i, (_, upper) in enumerate(normalized_lines):
-        if "JUMLAH AKHIR" in upper:
-            final_index = i
-
-    if final_index is None:
-        return ""
-
-    return "\n".join(
-        line for line, _ in normalized_lines[final_index:final_index + 8]
-    )
-
-
-def extract_closing_votes_final_table(image):
-    """
-    Membaca nilai JUMLAH AKHIR pada halaman penutup.
-
-    Untuk TPS > 15, formulir dapat mempunyai dua tabel berurutan:
-    tabel pertama sampai JUMLAH PINDAHAN dan tabel kedua sampai JUMLAH AKHIR.
-    OCR kadang tidak mengenali teks header JUMLAH AKHIR, sehingga deteksi
-    menggunakan kemunculan BARIS A/B/C yang kedua.
-    """
-    result = {
-        "suara_sah": None,
-        "suara_tidak_sah": None,
-        "total_suara": None,
-    }
-
-    # Posisi tabel kedua pada formulir yang terlihat pada PDF pengguna.
-    # Sedikit overlap tetap diberikan agar baris header tabel kedua tidak hilang.
-    h = image.height
-    crop_y = int(h * 0.48)
-    crop = (0, crop_y, image.width, image.height)
-
-    text = _ocr_variant(
-        image,
-        psm=6,
-        scale=4,
-        crop=crop,
-    )
-
-    if not text:
-        return result
-
-    lines = [
-        normalize_text(x).strip()
-        for x in text.splitlines()
-        if normalize_text(x).strip()
-    ]
-
-    # OCR pada formulir sering mengubah huruf A menjadi A/L/LA atau
-    # menambahkan garis tabel. Karena itu klasifikasi memakai isi label,
-    # bukan nomor A/B/C semata.
-    a_rows = []
-    b_rows = []
-    c_rows = []
-
-    for line in lines:
-        upper = line.upper()
-        nums = _extract_numbers_from_ocr_line(line)
-        if not nums:
-            continue
-
-        if (
-            "JUMLAH SELURUH SUARA SAH DAN TIDAK SAH" in upper
-            or "JUMLAH SELURUH SUARA SAHDAN TIDAK SAH" in upper
-        ):
-            c_rows.append(nums[-1])
-            continue
-
-        if "JUMLAH SUARA TIDAK SAH" in upper:
-            b_rows.append(nums[-1])
-            continue
-
-        if "JUMLAH SELURUH SUARA SAH" in upper:
-            a_rows.append(nums[-1])
-            continue
-
-    # Hanya gunakan parser ini bila benar-benar ada tabel kedua.
-    # Satu tabel saja berarti angka terakhir adalah JUMLAH PINDAHAN.
-    if len(a_rows) < 2 or len(c_rows) < 2:
-        return result
-
-    # Kemunculan terakhir A/C berasal dari tabel kedua / JUMLAH AKHIR.
-    result["suara_sah"] = a_rows[-1]
-    result["total_suara"] = c_rows[-1]
-
-    # Nilai B pada scan tabel dua-kolom sering paling sulit dibaca.
-    # Jika A dan C jelas, B dihitung dari keduanya sehingga tidak mengambil
-    # angka OCR yang salah dari kolom TPS.
-    if result["total_suara"] >= result["suara_sah"]:
-        result["suara_tidak_sah"] = (
-            result["total_suara"] - result["suara_sah"]
-        )
-    elif b_rows:
-        result["suara_tidak_sah"] = b_rows[-1]
-
-    return result
-
-
 def extract_closing_votes_positional(image):
     """
-    Kompatibilitas dengan fungsi lama.
-    Sekarang pembacaan utama memakai bagian JUMLAH AKHIR, bukan angka
-    paling kanan dari seluruh halaman.
+    Ambil nilai suara_sah / suara_tidak_sah / total_suara dari tabel
+    berdasarkan posisi baris & kolom asli di gambar, bukan urutan
+    linear hasil OCR teks. Angka diambil dari sel PALING KANAN pada
+    baris yang memuat label terkait (kolom "Jumlah Akhir").
     """
-    result = extract_closing_votes_final_table(image)
 
-    if any(result.values()):
-        return result
-
-    # Fallback terakhir memakai OCR koordinat lama.
     words = ocr_table_data(image, psm=6)
+
     if not words:
-        return result
+        return {
+            "suara_sah": None,
+            "suara_tidak_sah": None,
+            "total_suara": None,
+        }
 
     rows = _table_rows(
         words,
         y_tol=max(8, int(image.height / 180)),
     )
 
+    out = {
+        "suara_sah": None,
+        "suara_tidak_sah": None,
+        "total_suara": None,
+    }
+
     for row in rows:
-        upper = row["text"].upper()
-        key = None
-        if "JUMLAH SELURUH SUARA SAH DAN TIDAK SAH" in upper:
-            key = "total_suara"
-        elif "JUMLAH SUARA TIDAK SAH" in upper:
-            key = "suara_tidak_sah"
-        elif "JUMLAH SELURUH SUARA SAH" in upper:
+
+        u = row["text"].upper()
+
+        if "SUARA SAH" in u and "TIDAK SAH" not in u:
             key = "suara_sah"
 
-        if key is None:
+        elif "SUARA TIDAK SAH" in u:
+            key = "suara_tidak_sah"
+
+        elif (
+            "JUMLAH SELURUH SUARA SAH DAN" in u
+            or re.search(r"\bTOTAL\b", u)
+        ):
+            key = "total_suara"
+
+        else:
             continue
 
-        nums = []
+        candidates = []
+
         for w in row["words"]:
+
             n = _numeric_token(w["text"])
+
             if n is not None:
-                nums.append((w["x"] + w["w"], n))
+                candidates.append(
+                    (w["x"] + w["w"], n)
+                )
 
-        if nums:
-            result[key] = nums[-1][1]
+        if candidates:
+            candidates.sort(key=lambda z: z[0])
+            # ambil nilai dari sel paling kanan di baris ini
+            out[key] = candidates[-1][1]
 
-    sah = result.get("suara_sah")
-    tidak = result.get("suara_tidak_sah")
-    total = result.get("total_suara")
+    if (
+        out["total_suara"] is None
+        and out["suara_sah"] is not None
+        and out["suara_tidak_sah"] is not None
+    ):
+        out["total_suara"] = (
+            out["suara_sah"] + out["suara_tidak_sah"]
+        )
 
-    if sah is not None and total is not None:
-        result["suara_tidak_sah"] = total - sah
-    elif sah is not None and tidak is not None:
-        result["total_suara"] = sah + tidak
-    elif tidak is not None and total is not None:
-        result["suara_sah"] = total - tidak
-
-    return result
+    return out
 
 
 def refine_closing_data_with_positional(
@@ -1122,45 +1040,59 @@ def refine_closing_data_with_positional(
     dpi=300,
 ):
     """
-    Selalu periksa tabel JUMLAH AKHIR pada halaman penutup.
+    Lengkapi / perbaiki jumlah_akhir_suara_sah, jumlah_akhir_suara_tidak_sah,
+    dan jumlah_akhir_total_suara dengan hasil OCR berbasis koordinat, HANYA
+    jika hasil dari extract_closing_vote_data() tidak lengkap (ada yang None).
 
-    Ini sengaja tidak hanya berjalan ketika nilai lama None. Parser linear
-    bisa mengembalikan angka JUMLAH PINDAHAN yang tampak valid, sehingga
-    kondisi "None" saja tidak cukup untuk mendeteksi kesalahan.
+    Jika suara_sah dan suara_tidak_sah berhasil didapat ulang, total_suara
+    dihitung ulang dari penjumlahan keduanya -- ini juga memperbaiki kasus
+    di mana total_suara sebelumnya terisi angka yang KELIRU (misalnya
+    kebetulan sama dengan jumlah TPS, bukan total suara asli).
     """
+
+    votes_incomplete = (
+        closing_data.get("jumlah_akhir_suara_sah") is None
+        or closing_data.get("jumlah_akhir_suara_tidak_sah") is None
+    )
+
+    if not votes_incomplete:
+        return closing_data
+
     try:
         image = render_page(
             doc,
             page_index,
             dpi=max(dpi, 300),
         )
-        positional = extract_closing_votes_final_table(image)
+
+        positional = extract_closing_votes_positional(
+            image
+        )
+
     except Exception:
         return closing_data
 
-    # Hanya ganti dengan hasil parser final-table yang benar-benar ditemukan.
     for key, pos_key in (
         ("jumlah_akhir_suara_sah", "suara_sah"),
         ("jumlah_akhir_suara_tidak_sah", "suara_tidak_sah"),
         ("jumlah_akhir_total_suara", "total_suara"),
     ):
+
         if positional.get(pos_key) is not None:
             closing_data[key] = positional[pos_key]
 
+    # Hitung ulang total begitu sah & tidak sah sudah lengkap.
+    # Ini juga menggantikan total lama yang mungkin keliru.
+
     sah = closing_data.get("jumlah_akhir_suara_sah")
     tidak = closing_data.get("jumlah_akhir_suara_tidak_sah")
-    total = closing_data.get("jumlah_akhir_total_suara")
 
-    if sah is not None and total is not None:
-        if total >= sah:
-            closing_data["jumlah_akhir_suara_tidak_sah"] = total - sah
+    if sah is not None and tidak is not None:
 
-    elif sah is not None and tidak is not None:
-        closing_data["jumlah_akhir_total_suara"] = sah + tidak
+        calculated_total = sah + tidak
 
-    elif tidak is not None and total is not None:
-        if total >= tidak:
-            closing_data["jumlah_akhir_suara_sah"] = total - tidak
+        if closing_data.get("jumlah_akhir_total_suara") != calculated_total:
+            closing_data["jumlah_akhir_total_suara"] = calculated_total
 
     return closing_data
 
@@ -1522,92 +1454,12 @@ def collect_row_numbers(all_lines, start_idx, boundary_idx):
     return nums
 
 
-def _party_final_candidates_from_image(image):
-    """
-    Ambil nilai JUMLAH AKHIR partai dari koordinat tabel.
-
-    Jangan bergantung pada header "JUMLAH AKHIR" karena OCR sering salah
-    mengenali header tersebut. Baris "JUMLAH SUARA SAH PARTAI POLITIK DAN
-    CALON" sendiri sudah cukup untuk menemukan angka final: angka final
-    adalah angka paling kanan pada baris tersebut.
-    """
-    words = ocr_table_data(image, psm=6)
-    if not words:
-        return []
-
-    rows = _table_rows(
-        words,
-        y_tol=max(8, int(image.height / 180)),
-    )
-
-    results = []
-
-    for idx, row in enumerate(rows):
-        upper = row["text"].upper()
-
-        if not (
-            "JUMLAH SUARA SAH PARTAI POLITIK DAN CALON" in upper
-            or "JUMLAH SUARA SAH PARTAI POLITIK" in upper
-        ):
-            continue
-
-        numeric = []
-        for w in row["words"]:
-            n = _numeric_token(w["text"])
-            if n is not None:
-                numeric.append((w["x"] + w["w"], n))
-
-        if numeric:
-            numeric.sort(key=lambda z: z[0])
-            results.append((row["cy"], numeric[-1][1]))
-            continue
-
-        # Bila angka final berada satu baris di bawah label.
-        for next_idx in range(idx + 1, min(idx + 3, len(rows))):
-            numeric = []
-            for w in rows[next_idx]["words"]:
-                n = _numeric_token(w["text"])
-                if n is not None:
-                    numeric.append((w["x"] + w["w"], n))
-            if numeric:
-                numeric.sort(key=lambda z: z[0])
-                results.append((rows[next_idx]["cy"], numeric[-1][1]))
-                break
-
-    return results
-
-
-def _party_positional_map(page_images):
-    """Map halaman -> daftar kandidat nilai final partai secara posisi."""
-    mapping = {}
-    for page_no, image in enumerate(page_images):
-        try:
-            mapping[page_no] = _party_final_candidates_from_image(image)
-        except Exception:
-            mapping[page_no] = []
-    return mapping
-
-
-def extract_party_results_multipage(page_texts, expected_tps=0, page_images=None):
-    """
-    Parser partai lintas halaman.
-
-    Perbaikan penting:
-    - tidak menjumlahkan angka dari beberapa halaman;
-    - mencari JUMLAH AKHIR, bukan JUMLAH PINDAHAN;
-    - jika page_images tersedia, nilai final diambil dari kolom posisi
-      JUMLAH AKHIR pada tabel, sehingga tidak tertukar dengan TPS/pindahan;
-    - kemunculan final terakhir untuk partai diprioritaskan.
-    """
+def extract_party_results_multipage(page_texts, expected_tps=0):
     all_lines = []
-    line_pages = []
-
-    for page_no, text in enumerate(page_texts):
+    for text in page_texts:
         normalized = normalize_text(text)
         lines = [x.strip() for x in normalized.splitlines() if x.strip()]
-        for line in lines:
-            all_lines.append(line)
-            line_pages.append(page_no)
+        all_lines.extend(lines)
 
     if not all_lines:
         return []
@@ -1628,106 +1480,56 @@ def extract_party_results_multipage(page_texts, expected_tps=0, page_images=None
         filtered_headings.append(item)
     headings = filtered_headings
 
-    positional = {}
-    if page_images:
-        positional = _party_positional_map(page_images)
-
     candidates = defaultdict(list)
 
     for pos, (start_i, party_number) in enumerate(headings):
-        next_heading_i = (
-            headings[pos + 1][0]
-            if pos + 1 < len(headings)
-            else len(all_lines)
-        )
+        next_heading_i = headings[pos + 1][0] if pos + 1 < len(headings) else len(all_lines)
 
-        final_occurrences = []
+        # kumpulkan semua baris yang mengandung label "final"
+        final_indices = []
         for i in range(start_i, next_heading_i):
             upper = all_lines[i].upper()
-            if (
-                "JUMLAH AKHIR" in upper
+            if ("JUMLAH AKHIR" in upper
                 or "JUMLAH SUARA SAH PARTAI POLITIK DAN CALON" in upper
-                or "JUMLAH SUARA SAH PARTAI POLITIK" in upper
-            ):
-                final_occurrences.append(i)
+                or "JUMLAH SUARA SAH PARTAI POLITIK" in upper):
+                final_indices.append(i)
 
-        if not final_occurrences:
+        if not final_indices:
             continue
 
-        # Coba dari kemunculan terakhir menuju awal. Ini penting untuk
-        # partai yang tabelnya berlanjut ke halaman berikutnya.
-        final_vote = None
-        selected_page = None
+        # pakai kemunculan label TERAKHIR di blok ini (lembar terakhir partai ini)
+        final_idx = final_indices[-1]
+        final_line = all_lines[final_idx]
 
-        for final_idx in reversed(final_occurrences):
-            page_no = line_pages[final_idx]
-            selected_page = page_no
+        # jaga-jaga kalau ada angka nempel di baris label itu sendiri
+        same_line_nums = numbers_from_line(clean_party_final_line(final_line))
 
-            # 1. Parser positional jika tersedia.
-            pos_values = positional.get(page_no, [])
-            if pos_values:
-                # Pilih kandidat terakhir pada halaman tersebut. Pada satu
-                # halaman umumnya hanya ada satu baris final untuk partai.
-                final_vote = pos_values[-1][1]
-                break
+        # kunci perbaikan: ambil SEMUA angka berurutan setelah label,
+        # bukan cuma angka pertama
+        row_nums = collect_row_numbers(all_lines, final_idx + 1, next_heading_i)
+        row_nums = same_line_nums + row_nums
 
-            # 2. Parser teks yang dikunci ke JUMLAH AKHIR.
-            explicit = find_explicit_final_number(
-                all_lines,
-                final_idx,
-                next_heading_i,
-            )
-            if explicit is not None:
-                final_vote = explicit
-                break
-
-            # 3. Fallback: ambil angka setelah label, tetapi jangan pernah
-            # membaca JUMLAH PINDAHAN.
-            for j in range(final_idx, min(final_idx + 8, next_heading_i)):
-                upper = all_lines[j].upper()
-                if "JUMLAH PINDAHAN" in upper:
-                    continue
-                nums = numbers_from_line(
-                    clean_party_final_line(all_lines[j])
-                    if j == final_idx
-                    else all_lines[j]
-                )
-                if nums:
-                    final_vote = nums[-1]
-                    break
-            if final_vote is not None:
-                break
+        # angka TERAKHIR pada baris itu = kolom "Jumlah Akhir"
+        # (kolom pertama = pindahan, kolom tengah = per-TPS, kolom akhir = total)
+        final_vote = row_nums[-1] if row_nums else None
 
         if final_vote is not None:
             candidates[party_number].append({
                 "partai": party_number,
-                "nama_partai": PARTY_NAMES.get(
-                    party_number,
-                    f"Partai {party_number}"
-                ),
+                "nama_partai": PARTY_NAMES.get(party_number, f"Partai {party_number}"),
                 "suara_akhir_partai": final_vote,
-                "_final_index": final_occurrences[-1],
-                "_page": selected_page,
+                "_final_index": final_idx,
             })
 
     cleaned = {}
     for party_number, items in candidates.items():
         if not items:
             continue
-        selected = sorted(
-            items,
-            key=lambda x: x.get("_final_index", -1)
-        )[-1]
-        selected = {
-            k: v for k, v in selected.items()
-            if not k.startswith("_")
-        }
+        # kalau ada beberapa kemunculan (lembar), ambil yang paling akhir
+        selected = sorted(items, key=lambda x: x.get("_final_index", -1))[-1]
         cleaned[party_number] = selected
 
-    return [
-        cleaned[key]
-        for key in sorted(cleaned)
-    ]
+    return [cleaned[key] for key in sorted(cleaned)]
 
 
 # ============================================================
@@ -2889,34 +2691,9 @@ def process_pdf_local_engine(
         # Parser utama multi halaman.
         # ----------------------------------------------------
 
-        # Siapkan gambar hanya untuk halaman yang mengandung indikasi tabel
-        # partai/final agar pembacaan posisi tetap akurat tanpa OCR semua
-        # halaman dua kali.
-        block_page_images = []
-        for page_offset, page_text in enumerate(block_page_texts):
-            upper = page_text.upper()
-            if (
-                "JUMLAH AKHIR" in upper
-                or "JUMLAH SUARA SAH PARTAI" in upper
-                or "PARTAI" in upper
-            ):
-                try:
-                    block_page_images.append(
-                        render_page(
-                            doc,
-                            start + page_offset,
-                            dpi=max(dpi_val, 300),
-                        )
-                    )
-                except Exception:
-                    block_page_images.append(None)
-            else:
-                block_page_images.append(None)
-
         party_results = extract_party_results_multipage(
             block_page_texts,
-            expected_tps=expected_tps,
-            page_images=block_page_images
+            expected_tps=expected_tps
         )
 
         # ----------------------------------------------------
