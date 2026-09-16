@@ -38,6 +38,29 @@ kolom, karena tidak bergantung pada urutan baca linear Tesseract.
 
 Fallback ini hanya dijalankan ketika hasil dari cara lama
 (extract_closing_vote_data) tidak lengkap.
+
+------------------------------------------------------------------
+CATATAN PERBAIKAN TAMBAHAN (extract_party_results_multipage):
+"JUMLAH AKHIR" pada formulir ini HANYA muncul sebagai JUDUL KOLOM
+tabel (bagian header, tepat sebelum daftar nomor urut baris
+1,2,3,...,N), BUKAN sebagai label baris data suara partai. Baris
+data suara partai selalu berlabel "JUMLAH SUARA SAH PARTAI POLITIK
+DAN CALON".
+
+Versi lama mencari kedua pola tersebut ("JUMLAH AKHIR" ATAU "JUMLAH
+SUARA SAH PARTAI POLITIK...") sebagai penanda baris final. Akibatnya,
+untuk partai KEDUA (dan seterusnya) dalam satu halaman/lembar, kode
+sering menangkap teks "JUMLAH AKHIR" yang sebenarnya adalah judul
+kolom tabel HALAMAN/PARTAI BERIKUTNYA (karena letaknya tepat setelah
+blok partai saat ini), lalu ikut membaca nomor urut baris (1,2,3,...)
+di bawahnya sebagai seolah-olah itu suara akhir partai -- makanya
+partai kedua dst selalu terbaca angka kecil seperti "15" (banyaknya
+baris nomor urut), sementara partai pertama tetap benar.
+
+Perbaikan: "JUMLAH AKHIR" dihapus dari daftar pemicu baris final.
+Sekarang HANYA "JUMLAH SUARA SAH PARTAI POLITIK DAN CALON" / "JUMLAH
+SUARA SAH PARTAI POLITIK" yang dipakai sebagai penanda, karena ini
+selalu merupakan baris DATA, bukan judul kolom.
 ------------------------------------------------------------------
 """
 
@@ -52,6 +75,33 @@ import pandas as pd
 import pytesseract
 
 from PIL import Image, ImageOps, ImageEnhance
+
+# ------------------------------------------------------------------
+# AI VISION FALLBACK (opsional)
+#
+# Modul ai_vision_fallback.py dipakai sebagai fallback TERAKHIR ketika
+# extract_closing_vote_data() (teks linear) DAN
+# extract_closing_votes_positional() (OCR koordinat) sama-sama gagal.
+#
+# Kalau file ai_vision_fallback.py tidak ada, atau ANTHROPIC_API_KEY
+# belum diset, engine tetap jalan normal seperti biasa TANPA AI -- ini
+# hanya lapisan tambahan opsional, bukan pengganti Tesseract.
+# ------------------------------------------------------------------
+
+try:
+    from ai_vision_fallback import (
+        AI_VISION_AVAILABLE,
+        extract_closing_data_with_ai,
+        extract_party_votes_with_ai,
+    )
+except ImportError:
+    AI_VISION_AVAILABLE = False
+
+    def extract_closing_data_with_ai(*args, **kwargs):
+        return None
+
+    def extract_party_votes_with_ai(*args, **kwargs):
+        return []
 
 
 # ============================================================
@@ -1094,6 +1144,51 @@ def refine_closing_data_with_positional(
         if closing_data.get("jumlah_akhir_total_suara") != calculated_total:
             closing_data["jumlah_akhir_total_suara"] = calculated_total
 
+    # ----------------------------------------------------------
+    # FALLBACK TERAKHIR: AI VISION
+    #
+    # Kalau OCR posisional MASIH belum melengkapi suara_sah / tidak_sah
+    # (biasa terjadi pada scan resolusi sangat rendah), coba minta
+    # Claude vision membacanya. Hanya jalan kalau AI_VISION_AVAILABLE
+    # (package + API key terpasang) -- kalau tidak, baris ini dilewati
+    # otomatis dan closing_data dikembalikan apa adanya seperti sebelumnya.
+    # ----------------------------------------------------------
+
+    still_incomplete = (
+        closing_data.get("jumlah_akhir_suara_sah") is None
+        or closing_data.get("jumlah_akhir_suara_tidak_sah") is None
+    )
+
+    if still_incomplete and AI_VISION_AVAILABLE:
+
+        try:
+            expected_tps = len(closing_data.get("tps", []))
+
+            ai_result = extract_closing_data_with_ai(
+                image,
+                expected_tps=expected_tps,
+            )
+
+        except Exception:
+            ai_result = None
+
+        if ai_result:
+
+            if closing_data.get("jumlah_akhir_suara_sah") is None:
+                closing_data["jumlah_akhir_suara_sah"] = ai_result.get("suara_sah")
+
+            if closing_data.get("jumlah_akhir_suara_tidak_sah") is None:
+                closing_data["jumlah_akhir_suara_tidak_sah"] = ai_result.get("suara_tidak_sah")
+
+            sah = closing_data.get("jumlah_akhir_suara_sah")
+            tidak = closing_data.get("jumlah_akhir_suara_tidak_sah")
+
+            if sah is not None and tidak is not None:
+                closing_data["jumlah_akhir_total_suara"] = sah + tidak
+
+            elif ai_result.get("total_suara") is not None:
+                closing_data["jumlah_akhir_total_suara"] = ai_result.get("total_suara")
+
     return closing_data
 
 
@@ -1485,12 +1580,27 @@ def extract_party_results_multipage(page_texts, expected_tps=0):
     for pos, (start_i, party_number) in enumerate(headings):
         next_heading_i = headings[pos + 1][0] if pos + 1 < len(headings) else len(all_lines)
 
-        # kumpulkan semua baris yang mengandung label "final"
+        # ------------------------------------------------------
+        # PERBAIKAN: cari HANYA baris label "JUMLAH SUARA SAH
+        # PARTAI POLITIK DAN CALON" / "...PARTAI POLITIK".
+        #
+        # "JUMLAH AKHIR" SENGAJA TIDAK dipakai lagi sebagai
+        # pemicu di sini -- di dokumen ini, "JUMLAH AKHIR" hanya
+        # muncul sebagai JUDUL KOLOM tabel (di baris header,
+        # sebelum daftar nomor urut 1,2,3,...,N), bukan sebagai
+        # label baris data. Kalau dipakai sebagai pemicu, kode
+        # bisa salah menangkap header kolom PARTAI/LEMBAR
+        # BERIKUTNYA (yang letaknya tepat setelah blok partai
+        # ini) dan malah membaca nomor urut baris (1,2,3,...)
+        # sebagai seolah-olah itu suara akhir partai -- inilah
+        # sebab partai kedua dst dalam satu halaman selalu
+        # terbaca angka kecil (banyaknya baris nomor urut),
+        # sementara partai pertama tetap benar.
+        # ------------------------------------------------------
         final_indices = []
         for i in range(start_i, next_heading_i):
             upper = all_lines[i].upper()
-            if ("JUMLAH AKHIR" in upper
-                or "JUMLAH SUARA SAH PARTAI POLITIK DAN CALON" in upper
+            if ("JUMLAH SUARA SAH PARTAI POLITIK DAN CALON" in upper
                 or "JUMLAH SUARA SAH PARTAI POLITIK" in upper):
                 final_indices.append(i)
 
@@ -1504,8 +1614,8 @@ def extract_party_results_multipage(page_texts, expected_tps=0):
         # jaga-jaga kalau ada angka nempel di baris label itu sendiri
         same_line_nums = numbers_from_line(clean_party_final_line(final_line))
 
-        # kunci perbaikan: ambil SEMUA angka berurutan setelah label,
-        # bukan cuma angka pertama
+        # kunci perbaikan sebelumnya (tetap dipertahankan): ambil SEMUA
+        # angka berurutan setelah label, bukan cuma angka pertama
         row_nums = collect_row_numbers(all_lines, final_idx + 1, next_heading_i)
         row_nums = same_line_nums + row_nums
 
@@ -2745,6 +2855,50 @@ def process_pdf_local_engine(
                     found_numbers.add(
                         number
                     )
+
+        # ----------------------------------------------------
+        # FALLBACK TERAKHIR: AI VISION
+        #
+        # Kalau MASIH belum lengkap 18 partai setelah parser teks
+        # (multi halaman + per halaman), coba minta Claude vision
+        # membaca halaman-halaman blok desa ini. Hanya jalan kalau
+        # AI_VISION_AVAILABLE (package + API key terpasang), dan
+        # hanya untuk halaman yang belum menghasilkan partai baru --
+        # supaya panggilan API tetap minim.
+        # ----------------------------------------------------
+
+        if len(found_numbers) < 18 and AI_VISION_AVAILABLE:
+
+            for page_index in range(start, end + 1):
+
+                if len(found_numbers) >= 18:
+                    break
+
+                try:
+                    page_image = render_page(
+                        doc,
+                        page_index,
+                        dpi=max(dpi_val, 300),
+                    )
+
+                    ai_party_results = extract_party_votes_with_ai(
+                        page_image,
+                        PARTY_NAMES,
+                    )
+
+                except Exception:
+                    ai_party_results = []
+
+                for item in ai_party_results:
+
+                    number = item.get("partai")
+
+                    if (
+                        number is not None
+                        and number not in found_numbers
+                    ):
+                        party_results.append(item)
+                        found_numbers.add(number)
 
         # ----------------------------------------------------
         # Hapus duplikat.
