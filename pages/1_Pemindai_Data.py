@@ -749,6 +749,73 @@ if result:
         # bukan OK. Data asli di result tetap tidak diubah.
         parties_display = parties.copy()
 
+        # Tambahkan rekap suara kelurahan/desa ke setiap baris partai.
+        # Sumbernya adalah tabel ranges pada Point 2, sehingga nilai
+        # suara sah, tidak sah, dan total suara konsisten dengan rekap desa.
+        village_vote_columns = [
+            "kelurahan",
+            "suara_sah",
+            "suara_tidak_sah",
+            "total_suara",
+        ]
+
+        if (
+            "kelurahan" in parties_display.columns
+            and all(column in ranges.columns for column in village_vote_columns)
+        ):
+            village_votes = ranges[village_vote_columns].copy()
+            village_votes = village_votes.drop_duplicates(subset=["kelurahan"])
+
+            # Hapus kolom lama jika ternyata sudah ada di data parties,
+            # lalu ambil nilai resmi dari rekap kelurahan pada Point 2.
+            for column in [
+                "suara_sah",
+                "suara_tidak_sah",
+                "total_suara",
+            ]:
+                if column in parties_display.columns:
+                    parties_display = parties_display.drop(columns=[column])
+
+            parties_display = parties_display.merge(
+                village_votes,
+                on="kelurahan",
+                how="left",
+            )
+
+        # Susun kolom agar informasi suara kelurahan langsung terlihat
+        # setelah suara akhir partai.
+        preferred_columns = [
+            "kelurahan",
+            "nama_partai",
+            "no_partai",
+            "suara_akhir_partai",
+            "suara_sah",
+            "suara_tidak_sah",
+            "total_suara",
+            "halaman",
+            "provinsi",
+            "dapil",
+            "kab_kota",
+            "kecamatan",
+            "status_validasi",
+        ]
+
+        ordered_columns = [
+            column
+            for column in preferred_columns
+            if column in parties_display.columns
+        ]
+
+        remaining_columns = [
+            column
+            for column in parties_display.columns
+            if column not in ordered_columns
+        ]
+
+        parties_display = parties_display[
+            ordered_columns + remaining_columns
+        ]
+
         if (
             "halaman" in parties_display.columns
             and "status_validasi" in parties_display.columns
