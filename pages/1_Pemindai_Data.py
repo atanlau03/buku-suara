@@ -62,6 +62,7 @@ from database import (
 from local_ocr_engine import (
     process_pdf_local_engine,
 )
+from excel_export import build_excel
 
 
 # ============================================================
@@ -197,6 +198,8 @@ def worker_process(
     ] = "Menyiapkan OCR lokal..."
 
 
+    file_results = []
+
     buckets = {
         "summary": [],
         "db": [],
@@ -295,6 +298,8 @@ def worker_process(
                 )
             )
 
+            file_results.append((file_name, result))
+
             # Simpan hasil lengkap secara permanen untuk dibuka kembali
             # dari Dashboard tanpa upload atau scan ulang.
             save_scan_result(
@@ -367,6 +372,16 @@ def worker_process(
     # =========================================================
     # GABUNGKAN HASIL
     # =========================================================
+
+    st.session_state[
+        "scan_file_results"
+    ] = file_results
+
+    try:
+        st.session_state["excel_bytes"] = build_excel(file_results)
+    except Exception as excel_error:
+        st.session_state["excel_bytes"] = None
+        status["message"] = f"OCR selesai, tetapi Excel gagal dibuat: {excel_error}"
 
     st.session_state[
         "scan_result"
@@ -551,6 +566,8 @@ else:
             st.session_state[
                 "scan_result"
             ] = None
+            st.session_state["scan_file_results"] = []
+            st.session_state["excel_bytes"] = None
 
 
             # ------------------------------------------------
@@ -636,6 +653,23 @@ def render_progress_section():
                 "Selesai.",
             )
         )
+
+        # Fragment ini ikut melakukan polling. Karena worker berjalan di
+        # background, tombol download ditempatkan di sini agar langsung
+        # muncul begitu proses selesai tanpa perlu refresh browser manual.
+        excel_bytes = st.session_state.get("excel_bytes")
+        if excel_bytes:
+            st.divider()
+            st.subheader("⬇️ Excel Hasil Rekap")
+            st.download_button(
+                label="📥 Download Excel Otomatis",
+                data=excel_bytes,
+                file_name="hasil_rekap_kpu.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                use_container_width=True,
+                key="download_excel_progress",
+            )
 
 
 render_progress_section()
@@ -865,6 +899,29 @@ if result:
                     "^ = halaman dengan suara akhir partai yang perlu dilihat ulang. "
                     f"Jumlah: {jumlah_perlu_dicek} data."
                 )
+
+
+    # ========================================================
+    # EXCEL OTOMATIS
+    # ========================================================
+
+    excel_bytes = st.session_state.get("excel_bytes")
+
+    if excel_bytes:
+        st.divider()
+        st.subheader("⬇️ Excel Hasil Rekap")
+        st.success(
+            "Excel sudah dibuat otomatis dari PDF yang diproses. "
+            "Sheet dipisahkan berdasarkan dapil dan angka divalidasi secara logika."
+        )
+        st.download_button(
+            label="📥 Download Excel Otomatis",
+            data=excel_bytes,
+            file_name="hasil_rekap_kpu.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True,
+        )
 
 
     # ========================================================

@@ -150,6 +150,16 @@ def get_tesseract():
             pytesseract.pytesseract.tesseract_cmd = path
             return path
 
+    # Cari dari PATH agar Tesseract portable / hasil instalasi custom juga terdeteksi.
+    try:
+        import shutil
+        path = shutil.which("tesseract")
+        if path:
+            pytesseract.pytesseract.tesseract_cmd = path
+            return path
+    except Exception:
+        pass
+
     return None
 
 
