@@ -4,6 +4,7 @@ uploaded_pdfs/
 # Secrets Streamlit — JANGAN pernah commit file ini
 .streamlit/secrets.toml
 
+<<<<<<< HEAD
 # Environment lokal
 .env
 .venv/
@@ -12,6 +13,13 @@ uploaded_pdfs/
 __pycache__/
 *.pyc
 *.pyo
+=======
+# Env lokal
+.env
+.venv/
+__pycache__/
+*.pyc
+>>>>>>> main
 
 # Database lokal
 pileg.db
