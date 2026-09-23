@@ -4,14 +4,38 @@ uploaded_pdfs/
 # Secrets Streamlit — JANGAN pernah commit file ini
 .streamlit/secrets.toml
 
-# Env lokal
+# Environment lokal
 .env
 .venv/
+
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+
 # Database lokal
 pileg.db
 *.db
 
 # Hasil pemindaian lokal
 scan_results/
+
+# Google OAuth - JANGAN PERNAH DI-UPLOAD
+credentials.json
+token.json
+client_secret*.json
+
+# Hasil proses OCR lokal
+outputs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+
+# Local state
+processor_state.json
+
+# OS
+Thumbs.db
+.DS_Store
