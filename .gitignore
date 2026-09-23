@@ -1,0 +1,38 @@
+# PDF hasil upload pengguna (bisa berisi data pemilih/wilayah yang sensitif)
+uploaded_pdfs/
+
+# Secrets Streamlit — JANGAN pernah commit file ini
+.streamlit/secrets.toml
+
+# Env lokal
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# Database lokal
+pileg.db
+*.db
+
+# Hasil pemindaian lokal
+scan_results/
+
+# Google OAuth - JANGAN PERNAH DI-UPLOAD
+credentials.json
+token.json
+client_secret*.json
+
+# Hasil proses OCR lokal
+outputs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+
+# Local state
+processor_state.json
+
+# OS
+Thumbs.db
+.DS_Store
