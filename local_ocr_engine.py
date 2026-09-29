@@ -15,36 +15,35 @@ Alur pembacaan:
 
 Tidak menggunakan Gemini atau AI eksternal.
 
-------------------------------------------------------------------
-CATATAN PERBAIKAN:
-Untuk desa dengan jumlah TPS banyak (biasanya >= 16), tabel SUARA SAH /
-SUARA TIDAK SAH / TOTAL pada formulir sering dicetak dalam 2 blok kolom
-berdampingan (misal TPS 1-13 di kiri, TPS 14-25 di kanan). Saat halaman
-itu di-OCR menjadi teks linear, urutan angkanya bisa kacau karena dua
-blok kolom terbaca bergantian -- bukan berurutan seperti yang diasumsikan
-oleh extract_closing_vote_data() (yang membaca angka per baris teks).
+PRINSIP PENTING:
+- Logic lama dipertahankan.
+- Hasil lama yang sudah masuk akal tidak diganti sembarangan.
+- Text Layer hanya dipakai jika terlihat relevan secara struktur.
+- OCR menjadi fallback ketika Text Layer kosong/tidak berguna.
+- Validasi angka tetap menggunakan hubungan:
+      suara_sah + suara_tidak_sah = total_suara
+- JUMLAH AKHIR diprioritaskan.
+- JUMLAH PINDAHAN tidak dianggap sebagai hasil akhir.
 
-Akibatnya: suara_sah / suara_tidak_sah bisa gagal terbaca (None), dan
-total_suara bisa salah menangkap angka nomor urut TPS (bukan total
-suara asli).
+PERBAIKAN POSISIONAL:
+Untuk desa dengan jumlah TPS banyak, tabel SUARA SAH /
+SUARA TIDAK SAH / TOTAL dapat dicetak dalam 2 blok kolom.
+OCR linear dapat mengacak urutan angka.
 
-Untuk itu ditambahkan extract_closing_votes_positional(), yang meng-
-OCR halaman dengan pytesseract.image_to_data (bukan image_to_string),
-lalu mengelompokkan kata berdasarkan POSISI Y asli di gambar menjadi
-baris yang sebenarnya. Nilai diambil dari angka PALING KANAN pada baris
-yang memuat label "SUARA SAH" dll -- sama seperti kolom "Jumlah Akhir"
-pada formulir asli. Cara ini kebal terhadap tabel yang terpecah 2 kolom
-kolom, karena tidak bergantung pada urutan baca linear Tesseract.
+Untuk itu tersedia:
+    extract_closing_votes_positional()
 
-Fallback ini hanya dijalankan ketika hasil dari cara lama
-(extract_closing_vote_data) tidak lengkap.
-------------------------------------------------------------------
+Fungsi tersebut menggunakan pytesseract.image_to_data()
+untuk mendapatkan posisi X/Y kata dan mengambil angka dari
+kolom paling kanan pada baris terkait.
+
+Fallback positional hanya digunakan bila hasil parser utama
+belum lengkap.
 """
 
 import io
 import os
 import re
-import time
 from collections import defaultdict
 
 import fitz
@@ -159,10 +158,18 @@ def render_page(doc, page_index, dpi=300):
 
 
 # ============================================================
-# OCR
+# OCR PREPROCESSING
 # ============================================================
 
 def preprocess_image(image):
+    """
+    Preprocessing dasar yang sudah dipakai sistem lama.
+
+    Sengaja tidak dibuat terlalu agresif karena dokumen KPU
+    mempunyai garis tabel, kotak, angka, dan teks kecil yang
+    dapat rusak jika threshold terlalu ekstrem.
+    """
+
     gray = ImageOps.grayscale(image)
 
     gray = ImageEnhance.Contrast(
@@ -171,6 +178,10 @@ def preprocess_image(image):
 
     return gray
 
+
+# ============================================================
+# OCR IMAGE
+# ============================================================
 
 def ocr_image(
     image,
@@ -195,11 +206,124 @@ def ocr_image(
         return ""
 
 
+# ============================================================
+# TEXT LAYER VALIDATION
+# ============================================================
+
+def text_layer_quality(text):
+    """
+    Menilai apakah Text Layer PDF terlihat seperti teks KPU
+    yang berguna.
+
+    PENTING:
+    Fungsi ini bukan penentu benar/salah isi data.
+
+    Tujuannya hanya menjawab:
+        "Apakah Text Layer ini layak dipakai sebagai sumber
+         teks awal, atau kemungkinan besar hanya garbage?"
+
+    Kita sengaja menggunakan kriteria konservatif.
+    """
+
+    if not text:
+        return 0
+
+    normalized = normalize_upper(text)
+
+    if not normalized:
+        return 0
+
+    score = 0
+
+    # Panjang teks
+    if len(normalized) >= 100:
+        score += 1
+
+    if len(normalized) >= 300:
+        score += 1
+
+    # Struktur umum formulir KPU
+    structural_keywords = [
+        "TPS",
+        "PARTAI",
+        "SUARA",
+        "KELURAHAN",
+        "DESA",
+        "KECAMATAN",
+        "PROVINSI",
+        "JUMLAH",
+    ]
+
+    found_keywords = 0
+
+    for keyword in structural_keywords:
+        if keyword in normalized:
+            found_keywords += 1
+
+    if found_keywords >= 2:
+        score += 2
+
+    if found_keywords >= 4:
+        score += 1
+
+    # Struktur yang sangat khas formulir rekap
+    if "JUMLAH AKHIR" in normalized:
+        score += 2
+
+    if "SUARA SAH" in normalized:
+        score += 1
+
+    if "TIDAK SAH" in normalized:
+        score += 1
+
+    if re.search(r"\bTPS\s*0*\d{1,3}\b", normalized):
+        score += 1
+
+    return score
+
+
+def text_layer_is_usable(text):
+    """
+    Text Layer dianggap cukup berguna jika:
+    - panjangnya memadai DAN
+    - memiliki struktur yang masuk akal.
+
+    Ini sengaja tidak menggantikan hasil OCR lama secara agresif.
+    """
+
+    if not text:
+        return False
+
+    if len(text.strip()) < 100:
+        return False
+
+    return text_layer_quality(text) >= 3
+
+
+# ============================================================
+# OCR PAGE
+# ============================================================
+
 def ocr_page(
     doc,
     page_index,
     dpi=300
 ):
+    """
+    Membaca satu halaman.
+
+    Urutan:
+    1. Ambil Text Layer.
+    2. Jika Text Layer cukup baik -> gunakan Text Layer.
+    3. Jika Text Layer kosong/meragukan -> OCR image.
+    4. Untuk OCR, tetap menggunakan PSM 6 dan 11 seperti sistem lama.
+    5. Hasil OCR terpanjang dipakai, seperti behavior lama.
+
+    Prinsip penting:
+    Text Layer yang sudah terlihat valid tidak diganti hanya karena
+    OCR menghasilkan teks lebih panjang.
+    """
+
     page = doc.load_page(
         page_index
     )
@@ -210,11 +334,26 @@ def ocr_page(
 
     text_layer = text_layer.strip()
 
-    if len(text_layer) >= 100:
+    # --------------------------------------------------------
+    # PERTAHANKAN TEXT LAYER YANG SUDAH BAGUS
+    # --------------------------------------------------------
+
+    if text_layer_is_usable(
+        text_layer
+    ):
         return text_layer
+
+    # --------------------------------------------------------
+    # Jika Tesseract tidak tersedia,
+    # kembalikan Text Layer apa adanya.
+    # --------------------------------------------------------
 
     if TESSERACT_PATH is None:
         return text_layer
+
+    # --------------------------------------------------------
+    # OCR fallback
+    # --------------------------------------------------------
 
     image = render_page(
         doc,
@@ -225,21 +364,50 @@ def ocr_page(
     texts = []
 
     for psm in (6, 11):
+
         txt = ocr_image(
             image,
             psm=psm
         )
 
         if txt:
-            texts.append(txt)
+            texts.append(
+                txt
+            )
 
     if not texts:
-        return ""
+        return text_layer
 
-    return max(
+    ocr_text = max(
         texts,
         key=len
     )
+
+    # --------------------------------------------------------
+    # Jika Text Layer ada tetapi pendek/meragukan, bandingkan
+    # secara sederhana.
+    #
+    # Jangan mengganti Text Layer yang secara struktur sudah
+    # cukup baik.
+    # --------------------------------------------------------
+
+    if text_layer:
+        layer_score = text_layer_quality(
+            text_layer
+        )
+
+        ocr_score = text_layer_quality(
+            ocr_text
+        )
+
+        if (
+            layer_score >= 3
+            and
+            layer_score >= ocr_score
+        ):
+            return text_layer
+
+    return ocr_text
 
 
 # ============================================================
@@ -366,10 +534,14 @@ def numbers_from_line(line):
     result = []
 
     for value in found:
-        number = clean_number(value)
+        number = clean_number(
+            value
+        )
 
         if number is not None:
-            result.append(number)
+            result.append(
+                number
+            )
 
     return result
 
@@ -398,7 +570,9 @@ def extract_tps_numbers(text):
             number = int(value)
 
             if 1 <= number <= 999:
-                result.append(number)
+                result.append(
+                    number
+                )
 
         except Exception:
             pass
@@ -471,6 +645,7 @@ def extract_village_name(text):
     ]
 
     for line in lines:
+
         clean = re.sub(
             r"\s+",
             " ",
@@ -486,6 +661,7 @@ def extract_village_name(text):
             "KELURAHAN / DESA"
             in upper
         ):
+
             value = re.sub(
                 r"(?i).*KELURAHAN\s*/\s*DESA",
                 "",
@@ -496,7 +672,7 @@ def extract_village_name(text):
                 r"^[.…\s:.-]+",
                 "",
                 value
-            ).strip()
+            )
 
             value = re.sub(
                 r"[.…]+",
@@ -510,11 +686,13 @@ def extract_village_name(text):
                 return value
 
     for line in lines:
+
         upper = line.upper()
 
         if upper.startswith(
             "DESA "
         ):
+
             value = line[5:].strip(
                 " :.-"
             )
@@ -533,10 +711,14 @@ def find_line(
     lines,
     patterns
 ):
-    for index, line in enumerate(lines):
+    for index, line in enumerate(
+        lines
+    ):
+
         upper = line.upper()
 
         for pattern in patterns:
+
             if pattern in upper:
                 return index, line
 
@@ -558,36 +740,19 @@ def extract_last_numbers(
 
 
 # ============================================================
-# DATA SUARA HALAMAN AKHIR (BERBASIS TEKS LINEAR)
+# DATA SUARA HALAMAN AKHIR
+# BERBASIS TEKS LINEAR
 # ============================================================
 
 def extract_closing_vote_data(text):
     """
-    PERBAIKAN PENTING:
+    Mengambil suara sah, tidak sah, dan total dari halaman akhir.
 
-    Formulir KPU untuk desa dengan TPS banyak (biasanya > 15) memecah
-    tabel SUARA SAH / SUARA TIDAK SAH / TOTAL menjadi DUA bagian pada
-    halaman yang sama:
+    Tetap menggunakan prinsip:
 
-        Tabel 1 (TPS 001-015) -> diakhiri kolom "JUMLAH PINDAHAN"
-        Tabel 2 (TPS 016-dst) -> diakhiri kolom "JUMLAH AKHIR"
-
-    Versi lama fungsi ini mengambil KEMUNCULAN PERTAMA dari setiap baris
-    label (SAH / TIDAK SAH / TOTAL), yang berarti ia salah mengambil
-    angka "JUMLAH PINDAHAN" (tabel 1) sebagai hasil akhir, padahal angka
-    yang benar ada di "JUMLAH AKHIR" pada tabel 2.
-
-    Versi ini mencari SEMUA kemunculan setiap baris label, lalu:
-      - Kemunculan PERTAMA -> angka terakhirnya adalah "Jumlah Pindahan"
-        (BUKAN nilai final), sisanya adalah suara per-TPS awal.
-      - Kemunculan TERAKHIR -> angka PERTAMA adalah pindahan yang diulang
-        (dibuang), angka PALING TERAKHIR adalah "Jumlah Akhir" yang benar.
-      - Kalau cuma ADA SATU kemunculan (desa dengan TPS sedikit, tidak
-        perlu tabel pindahan), berperilaku seperti sebelumnya: angka
-        terakhir langsung dianggap nilai final.
-
-    Semua nilai per-TPS dari tabel 1 dan tabel 2 digabung supaya
-    breakdown per-TPS tetap lengkap sepanjang jumlah TPS desa tsb.
+    - tabel pertama = kemungkinan JUMLAH PINDAHAN
+    - tabel terakhir = JUMLAH AKHIR
+    - nilai final berasal dari kemunculan terakhir
     """
 
     lines = [
@@ -617,13 +782,6 @@ def extract_closing_vote_data(text):
     if count == 0:
         return empty
 
-    # --------------------------------------------------------
-    # Predikat baris. PENTING: baris C ("...SAH DAN TIDAK SAH")
-    # secara substring JUGA mengandung teks baris A ("...SUARA SAH"),
-    # jadi baris A harus secara eksplisit MENOLAK baris yang
-    # mengandung "TIDAK SAH" supaya tidak tertukar dengan baris C.
-    # --------------------------------------------------------
-
     def is_row_a(u):
         return (
             "JUMLAH SELURUH SUARA SAH" in u
@@ -631,12 +789,18 @@ def extract_closing_vote_data(text):
         )
 
     def is_row_b(u):
-        return "JUMLAH SUARA TIDAK SAH" in u
+        return (
+            "JUMLAH SUARA TIDAK SAH"
+            in u
+        )
 
     def is_row_c(u):
         return (
-            "JUMLAH SELURUH SUARA SAH DAN TIDAK SAH" in u
-            or "JUMLAH SELURUH SUARA SAH DAN SUARA TIDAK SAH" in u
+            "JUMLAH SELURUH SUARA SAH DAN TIDAK SAH"
+            in u
+            or
+            "JUMLAH SELURUH SUARA SAH DAN SUARA TIDAK SAH"
+            in u
         )
 
     def occurrences_of(predicate):
@@ -646,17 +810,24 @@ def extract_closing_vote_data(text):
             if predicate(line.upper())
         ]
 
-    sah_occurrences = occurrences_of(is_row_a)
-    invalid_occurrences = occurrences_of(is_row_b)
-    total_occurrences = occurrences_of(is_row_c)
+    sah_occurrences = occurrences_of(
+        is_row_a
+    )
 
-    # Batas antar baris label -- dipakai supaya penggabungan baris
-    # lanjutan (untuk kasus OCR yang memecah satu baris jadi dua)
-    # tidak "memakan" baris label lain.
+    invalid_occurrences = occurrences_of(
+        is_row_b
+    )
+
+    total_occurrences = occurrences_of(
+        is_row_c
+    )
+
     all_boundaries = (
         set(sah_occurrences)
-        | set(invalid_occurrences)
-        | set(total_occurrences)
+        |
+        set(invalid_occurrences)
+        |
+        set(total_occurrences)
     )
 
     label_strip_pattern = (
@@ -667,14 +838,10 @@ def extract_closing_vote_data(text):
     )
 
     def numbers_on_row(line_idx):
-        """
-        Ambil angka pada baris label. Jika baris tersebut tidak
-        menghasilkan angka sama sekali (kemungkinan OCR memecahnya jadi
-        baris terpisah), coba gabungkan dengan baris-baris berikutnya
-        yang murni berisi angka, sampai bertemu baris label lain.
-        """
 
-        line = lines[line_idx]
+        line = lines[
+            line_idx
+        ]
 
         cleaned = re.sub(
             label_strip_pattern,
@@ -689,30 +856,42 @@ def extract_closing_vote_data(text):
             cleaned,
         )
 
-        nums = numbers_from_line(cleaned)
+        nums = numbers_from_line(
+            cleaned
+        )
 
         j = line_idx + 1
 
-        while j < len(lines) and j not in all_boundaries:
+        while (
+            j < len(lines)
+            and j not in all_boundaries
+        ):
 
-            candidate = lines[j].strip()
+            candidate = lines[
+                j
+            ].strip()
 
-            if re.fullmatch(r"[\d.,\s]+", candidate):
+            if re.fullmatch(
+                r"[\d.,\s]+",
+                candidate
+            ):
+
                 nums.extend(
-                    numbers_from_line(candidate)
+                    numbers_from_line(
+                        candidate
+                    )
                 )
+
                 j += 1
+
             else:
                 break
 
         return nums
 
-    def collect_final(occurrence_indices):
-        """
-        Gabungkan nilai per-TPS dari semua kemunculan baris label, dan
-        tentukan nilai FINAL dari kemunculan TERAKHIR (tabel "Jumlah
-        Akhir"), bukan kemunculan pertama (tabel "Jumlah Pindahan").
-        """
+    def collect_final(
+        occurrence_indices
+    ):
 
         if not occurrence_indices:
             return [], None
@@ -720,44 +899,69 @@ def extract_closing_vote_data(text):
         per_tps_values = []
         final_value = None
 
-        total_occ = len(occurrence_indices)
+        total_occ = len(
+            occurrence_indices
+        )
 
-        for pos, line_idx in enumerate(occurrence_indices):
+        for pos, line_idx in enumerate(
+            occurrence_indices
+        ):
 
-            nums = numbers_on_row(line_idx)
+            nums = numbers_on_row(
+                line_idx
+            )
 
             if not nums:
                 continue
 
-            is_first = (pos == 0)
-            is_last = (pos == total_occ - 1)
+            is_first = (
+                pos == 0
+            )
 
-            if is_first and is_last:
-                # Hanya satu kemunculan -> tidak ada tabel pindahan.
-                # Angka terakhir langsung menjadi nilai final.
-                per_tps_values.extend(nums[:-1])
+            is_last = (
+                pos == total_occ - 1
+            )
+
+            if (
+                is_first
+                and
+                is_last
+            ):
+
+                per_tps_values.extend(
+                    nums[:-1]
+                )
+
                 final_value = nums[-1]
 
             elif is_first:
-                # Tabel pertama (pindahan): buang angka terakhir
-                # (itu "Jumlah Pindahan", BUKAN nilai per-TPS/final).
-                per_tps_values.extend(nums[:-1])
+
+                per_tps_values.extend(
+                    nums[:-1]
+                )
 
             elif is_last:
-                # Tabel terakhir (akhir): buang angka pertama
-                # (pindahan yang diulang). Angka paling akhir = final.
+
                 tail = nums[1:]
 
                 if tail:
-                    per_tps_values.extend(tail[:-1])
+
+                    per_tps_values.extend(
+                        tail[:-1]
+                    )
+
                     final_value = tail[-1]
 
             else:
-                # Tabel tengah (jika ada > 2 bagian): buang angka
-                # pertama (pindahan) dan terakhir (subtotal barunya).
-                per_tps_values.extend(nums[1:-1])
 
-        return per_tps_values, final_value
+                per_tps_values.extend(
+                    nums[1:-1]
+                )
+
+        return (
+            per_tps_values,
+            final_value
+        )
 
     sah_values, sah_final = collect_final(
         sah_occurrences
@@ -772,19 +976,30 @@ def extract_closing_vote_data(text):
     )
 
     def pad_to_count(values):
-        values = list(values)[:count]
+
+        values = list(
+            values
+        )[:count]
 
         while len(values) < count:
             values.append(None)
 
         return values
 
-    sah_values = pad_to_count(sah_values)
-    invalid_values = pad_to_count(invalid_values)
-    total_values = pad_to_count(total_values)
+    sah_values = pad_to_count(
+        sah_values
+    )
+
+    invalid_values = pad_to_count(
+        invalid_values
+    )
+
+    total_values = pad_to_count(
+        total_values
+    )
 
     # --------------------------------------------------------
-    # Validasi matematika (tetap dipertahankan seperti versi lama)
+    # VALIDASI MATEMATIKA
     # --------------------------------------------------------
 
     if (
@@ -795,6 +1010,7 @@ def extract_closing_vote_data(text):
             for v in sah_values
         )
     ):
+
         sah_final = sum(
             sah_values
         )
@@ -807,6 +1023,7 @@ def extract_closing_vote_data(text):
             for v in invalid_values
         )
     ):
+
         invalid_final = sum(
             invalid_values
         )
@@ -816,20 +1033,25 @@ def extract_closing_vote_data(text):
         and sah_final is not None
         and invalid_final is not None
     ):
+
         total_final = (
             sah_final
-            + invalid_final
+            +
+            invalid_final
         )
 
     for i in range(count):
+
         if (
             total_values[i] is None
             and sah_values[i] is not None
             and invalid_values[i] is not None
         ):
+
             total_values[i] = (
                 sah_values[i]
-                + invalid_values[i]
+                +
+                invalid_values[i]
             )
 
     return {
@@ -844,26 +1066,23 @@ def extract_closing_vote_data(text):
 
 
 # ============================================================
-# DATA SUARA HALAMAN AKHIR (BERBASIS KOORDINAT OCR)
-# ============================================================
-#
-# Dipakai sebagai FALLBACK ketika extract_closing_vote_data()
-# (berbasis teks linear) gagal membaca suara_sah / suara_tidak_sah
-# dengan lengkap. Ini terjadi terutama pada desa dengan TPS banyak,
-# di mana tabelnya dicetak dalam 2 blok kolom berdampingan sehingga
-# urutan teks OCR linear menjadi kacau.
-#
-# Caranya: OCR ulang halaman dengan pytesseract.image_to_data untuk
-# mendapatkan posisi (x, y) setiap kata, lalu kelompokkan kata
-# menjadi baris berdasarkan POSISI Y ASLI di gambar (bukan urutan
-# baca linear Tesseract). Nilai "Jumlah Akhir" diambil dari angka
-# yang posisinya PALING KANAN pada baris yang memuat label terkait.
+# DATA SUARA HALAMAN AKHIR
+# BERBASIS KOORDINAT OCR
 # ============================================================
 
-def ocr_table_data(image, psm=6):
-    """OCR dengan koordinat kata. Dipakai khusus untuk tabel."""
+def ocr_table_data(
+    image,
+    psm=6
+):
+    """
+    OCR dengan koordinat kata.
+    """
+
     try:
-        img = preprocess_image(image)
+
+        img = preprocess_image(
+            image
+        )
 
         data = pytesseract.image_to_data(
             img,
@@ -877,98 +1096,190 @@ def ocr_table_data(image, psm=6):
 
     words = []
 
-    total = len(data.get("text", []))
+    total = len(
+        data.get(
+            "text",
+            []
+        )
+    )
 
-    for i in range(total):
+    for i in range(
+        total
+    ):
 
-        txt = str(data["text"][i]).strip()
+        txt = str(
+            data["text"][i]
+        ).strip()
 
         if not txt:
             continue
 
         try:
-            conf = float(data["conf"][i])
+            conf = float(
+                data["conf"][i]
+            )
         except Exception:
             conf = -1
 
-        words.append({
-            "text": txt,
-            "x": int(data["left"][i]),
-            "y": int(data["top"][i]),
-            "w": int(data["width"][i]),
-            "h": int(data["height"][i]),
-            "conf": conf,
-        })
+        words.append(
+            {
+                "text": txt,
+                "x": int(
+                    data["left"][i]
+                ),
+                "y": int(
+                    data["top"][i]
+                ),
+                "w": int(
+                    data["width"][i]
+                ),
+                "h": int(
+                    data["height"][i]
+                ),
+                "conf": conf,
+            }
+        )
 
     return words
 
 
-def _table_rows(words, y_tol=12):
-    """Kelompokkan kata menjadi baris berdasarkan posisi Y asli."""
+def _table_rows(
+    words,
+    y_tol=12
+):
+    """
+    Kelompokkan kata menjadi baris
+    berdasarkan posisi Y asli.
+    """
 
     rows = []
 
-    for w in sorted(words, key=lambda z: (z["y"], z["x"])):
+    for w in sorted(
+        words,
+        key=lambda z: (
+            z["y"],
+            z["x"]
+        )
+    ):
 
-        cy = w["y"] + w["h"] / 2
+        cy = (
+            w["y"]
+            +
+            w["h"] / 2
+        )
 
         target = None
 
         for row in rows:
-            if abs(cy - row["cy"]) <= y_tol:
+
+            if abs(
+                cy - row["cy"]
+            ) <= y_tol:
+
                 target = row
                 break
 
         if target is None:
-            target = {"cy": cy, "words": []}
-            rows.append(target)
 
-        target["words"].append(w)
+            target = {
+                "cy": cy,
+                "words": []
+            }
+
+            rows.append(
+                target
+            )
+
+        target["words"].append(
+            w
+        )
 
     for row in rows:
-        row["words"].sort(key=lambda z: z["x"])
-        row["text"] = " ".join(z["text"] for z in row["words"])
+
+        row["words"].sort(
+            key=lambda z: z["x"]
+        )
+
+        row["text"] = " ".join(
+            z["text"]
+            for z in row["words"]
+        )
 
     return rows
 
 
 def _numeric_token(token):
-    token = str(token).strip()
+    """
+    Hanya melakukan koreksi karakter OCR yang sangat konservatif:
 
-    if not re.fullmatch(r"[0-9OolI.,-]+", token):
+        O/o -> 0
+        I/l -> 1
+
+    Tidak melakukan:
+        S -> 5
+        B -> 8
+        G -> 6
+
+    karena koreksi agresif dapat menghasilkan angka palsu.
+    """
+
+    token = str(
+        token
+    ).strip()
+
+    if not re.fullmatch(
+        r"[0-9OolI.,-]+",
+        token
+    ):
         return None
 
     token = (
-        token.replace("O", "0")
+        token
+        .replace("O", "0")
         .replace("o", "0")
         .replace("I", "1")
         .replace("l", "1")
     )
 
-    token = token.replace(".", "").replace(",", "")
+    token = (
+        token
+        .replace(".", "")
+        .replace(",", "")
+    )
 
-    token = re.sub(r"[^0-9]", "", token)
+    token = re.sub(
+        r"[^0-9]",
+        "",
+        token
+    )
 
     if not token:
         return None
 
     try:
         return int(token)
+
     except Exception:
         return None
 
 
-def extract_closing_votes_positional(image):
+def extract_closing_votes_positional(
+    image
+):
     """
-    Ambil nilai suara_sah / suara_tidak_sah / total_suara dari tabel
-    berdasarkan posisi baris & kolom asli di gambar, bukan urutan
-    linear hasil OCR teks. Angka diambil dari sel PALING KANAN pada
-    baris yang memuat label terkait (kolom "Jumlah Akhir").
+    Ambil nilai suara berdasarkan posisi tabel.
+
+    Angka paling kanan pada baris terkait dianggap sebagai
+    kolom JUMLAH AKHIR.
     """
 
-    words = ocr_table_data(image, psm=6)
+    words = ocr_table_data(
+        image,
+        psm=6
+    )
 
     if not words:
+
         return {
             "suara_sah": None,
             "suara_tidak_sah": None,
@@ -977,7 +1288,12 @@ def extract_closing_votes_positional(image):
 
     rows = _table_rows(
         words,
-        y_tol=max(8, int(image.height / 180)),
+        y_tol=max(
+            8,
+            int(
+                image.height / 180
+            )
+        ),
     )
 
     out = {
@@ -988,18 +1304,32 @@ def extract_closing_votes_positional(image):
 
     for row in rows:
 
-        u = row["text"].upper()
+        u = row[
+            "text"
+        ].upper()
 
-        if "SUARA SAH" in u and "TIDAK SAH" not in u:
+        if (
+            "SUARA SAH" in u
+            and
+            "TIDAK SAH" not in u
+        ):
+
             key = "suara_sah"
 
         elif "SUARA TIDAK SAH" in u:
+
             key = "suara_tidak_sah"
 
         elif (
-            "JUMLAH SELURUH SUARA SAH DAN" in u
-            or re.search(r"\bTOTAL\b", u)
+            "JUMLAH SELURUH SUARA SAH DAN"
+            in u
+            or
+            re.search(
+                r"\bTOTAL\b",
+                u
+            )
         ):
+
             key = "total_suara"
 
         else:
@@ -1007,27 +1337,45 @@ def extract_closing_votes_positional(image):
 
         candidates = []
 
-        for w in row["words"]:
+        for w in row[
+            "words"
+        ]:
 
-            n = _numeric_token(w["text"])
+            n = _numeric_token(
+                w["text"]
+            )
 
             if n is not None:
+
                 candidates.append(
-                    (w["x"] + w["w"], n)
+                    (
+                        w["x"] + w["w"],
+                        n
+                    )
                 )
 
         if candidates:
-            candidates.sort(key=lambda z: z[0])
-            # ambil nilai dari sel paling kanan di baris ini
-            out[key] = candidates[-1][1]
+
+            candidates.sort(
+                key=lambda z: z[0]
+            )
+
+            out[key] = candidates[
+                -1
+            ][1]
 
     if (
         out["total_suara"] is None
-        and out["suara_sah"] is not None
-        and out["suara_tidak_sah"] is not None
+        and
+        out["suara_sah"] is not None
+        and
+        out["suara_tidak_sah"] is not None
     ):
+
         out["total_suara"] = (
-            out["suara_sah"] + out["suara_tidak_sah"]
+            out["suara_sah"]
+            +
+            out["suara_tidak_sah"]
         )
 
     return out
@@ -1040,59 +1388,107 @@ def refine_closing_data_with_positional(
     dpi=300,
 ):
     """
-    Lengkapi / perbaiki jumlah_akhir_suara_sah, jumlah_akhir_suara_tidak_sah,
-    dan jumlah_akhir_total_suara dengan hasil OCR berbasis koordinat, HANYA
-    jika hasil dari extract_closing_vote_data() tidak lengkap (ada yang None).
+    Positional OCR hanya digunakan bila hasil utama belum lengkap.
 
-    Jika suara_sah dan suara_tidak_sah berhasil didapat ulang, total_suara
-    dihitung ulang dari penjumlahan keduanya -- ini juga memperbaiki kasus
-    di mana total_suara sebelumnya terisi angka yang KELIRU (misalnya
-    kebetulan sama dengan jumlah TPS, bukan total suara asli).
+    Ini penting agar hasil lama yang sudah benar tidak diganti
+    oleh OCR alternatif secara sembarangan.
     """
 
     votes_incomplete = (
-        closing_data.get("jumlah_akhir_suara_sah") is None
-        or closing_data.get("jumlah_akhir_suara_tidak_sah") is None
+        closing_data.get(
+            "jumlah_akhir_suara_sah"
+        ) is None
+        or
+        closing_data.get(
+            "jumlah_akhir_suara_tidak_sah"
+        ) is None
     )
 
     if not votes_incomplete:
         return closing_data
 
     try:
+
         image = render_page(
             doc,
             page_index,
-            dpi=max(dpi, 300),
+            dpi=max(
+                dpi,
+                300
+            ),
         )
 
-        positional = extract_closing_votes_positional(
-            image
+        positional = (
+            extract_closing_votes_positional(
+                image
+            )
         )
 
     except Exception:
         return closing_data
 
     for key, pos_key in (
-        ("jumlah_akhir_suara_sah", "suara_sah"),
-        ("jumlah_akhir_suara_tidak_sah", "suara_tidak_sah"),
-        ("jumlah_akhir_total_suara", "total_suara"),
+        (
+            "jumlah_akhir_suara_sah",
+            "suara_sah"
+        ),
+        (
+            "jumlah_akhir_suara_tidak_sah",
+            "suara_tidak_sah"
+        ),
+        (
+            "jumlah_akhir_total_suara",
+            "total_suara"
+        ),
     ):
 
-        if positional.get(pos_key) is not None:
-            closing_data[key] = positional[pos_key]
+        if (
+            positional.get(
+                pos_key
+            )
+            is not None
+        ):
 
-    # Hitung ulang total begitu sah & tidak sah sudah lengkap.
-    # Ini juga menggantikan total lama yang mungkin keliru.
+            closing_data[
+                key
+            ] = positional[
+                pos_key
+            ]
 
-    sah = closing_data.get("jumlah_akhir_suara_sah")
-    tidak = closing_data.get("jumlah_akhir_suara_tidak_sah")
+    # --------------------------------------------------------
+    # VALIDASI ULANG TOTAL
+    # --------------------------------------------------------
 
-    if sah is not None and tidak is not None:
+    sah = closing_data.get(
+        "jumlah_akhir_suara_sah"
+    )
 
-        calculated_total = sah + tidak
+    tidak = closing_data.get(
+        "jumlah_akhir_suara_tidak_sah"
+    )
 
-        if closing_data.get("jumlah_akhir_total_suara") != calculated_total:
-            closing_data["jumlah_akhir_total_suara"] = calculated_total
+    if (
+        sah is not None
+        and
+        tidak is not None
+    ):
+
+        calculated_total = (
+            sah
+            +
+            tidak
+        )
+
+        if (
+            closing_data.get(
+                "jumlah_akhir_total_suara"
+            )
+            != calculated_total
+        ):
+
+            closing_data[
+                "jumlah_akhir_total_suara"
+            ] = calculated_total
 
     return closing_data
 
@@ -1101,7 +1497,9 @@ def refine_closing_data_with_positional(
 # PARTY
 # ============================================================
 
-def detect_party_number(line):
+def detect_party_number(
+    line
+):
     if not line:
         return None
 
@@ -1115,13 +1513,16 @@ def detect_party_number(line):
     ]
 
     for pattern in patterns:
+
         match = re.search(
             pattern,
             upper
         )
 
         if match:
+
             try:
+
                 number = int(
                     match.group(1)
                 )
@@ -1147,7 +1548,10 @@ def detect_party_heading(
         -1,
         -1
     ):
-        line = lines[i]
+
+        line = lines[
+            i
+        ]
 
         number = detect_party_number(
             line
@@ -1159,7 +1563,9 @@ def detect_party_heading(
     return None
 
 
-def is_party_final_label(line):
+def is_party_final_label(
+    line
+):
     if not line:
         return False
 
@@ -1177,7 +1583,9 @@ def is_party_final_label(line):
     )
 
 
-def clean_party_final_line(line):
+def clean_party_final_line(
+    line
+):
     if not line:
         return ""
 
@@ -1216,11 +1624,9 @@ def find_explicit_final_number(
     end_index
 ):
     """
-    Mencari angka yang benar-benar berada setelah
-    label JUMLAH AKHIR.
+    Mencari angka setelah JUMLAH AKHIR.
 
-    Fungsi ini sengaja tidak mengambil angka dari
-    JUMLAH PINDAHAN sebagai suara akhir.
+    Tidak mengambil angka dari JUMLAH PINDAHAN.
     """
 
     for i in range(
@@ -1230,7 +1636,10 @@ def find_explicit_final_number(
             len(lines)
         )
     ):
-        line = lines[i]
+
+        line = lines[
+            i
+        ]
 
         upper = line.upper()
 
@@ -1258,6 +1667,7 @@ def find_explicit_final_number(
                 len(lines)
             )
         ):
+
             nums = numbers_from_line(
                 lines[j]
             )
@@ -1268,45 +1678,54 @@ def find_explicit_final_number(
     return None
 
 
-def extract_party_results(text):
+def extract_party_results(
+    text
+):
     """
     Parser satu blok teks.
-
-    Fungsi ini tetap dipertahankan agar kompatibel dengan
-    kode lama.
-
-    Untuk PDF dengan banyak TPS dan tabel yang terpecah
-    lintas halaman, gunakan extract_party_results_multipage().
     """
 
     lines = [
         x.strip()
-        for x in normalize_text(text).splitlines()
+        for x in normalize_text(
+            text
+        ).splitlines()
         if x.strip()
     ]
 
     results = []
 
     expected_tps = len(
-        extract_tps_numbers(text)
+        extract_tps_numbers(
+            text
+        )
     )
 
     headings = []
 
-    for i, line in enumerate(lines):
+    for i, line in enumerate(
+        lines
+    ):
+
         number = detect_party_number(
             line
         )
 
         if number is not None:
+
             headings.append(
-                (i, number)
+                (
+                    i,
+                    number
+                )
             )
 
     for pos, (
         start_i,
         party_number
-    ) in enumerate(headings):
+    ) in enumerate(
+        headings
+    ):
 
         end_i = (
             headings[pos + 1][0]
@@ -1323,6 +1742,7 @@ def extract_party_results(text):
         for i, line in enumerate(
             block_lines
         ):
+
             upper = line.upper()
 
             if (
@@ -1332,6 +1752,7 @@ def extract_party_results(text):
                 "JUMLAH SUARA SAH PARTAI POLITIK"
                 in upper
             ):
+
                 final_idx = i
                 break
 
@@ -1345,9 +1766,11 @@ def extract_party_results(text):
         )
 
         if explicit_final is not None:
+
             final_vote = explicit_final
 
         else:
+
             tail = []
 
             final_line = block_lines[
@@ -1367,6 +1790,7 @@ def extract_party_results(text):
             for line in block_lines[
                 final_idx + 1:
             ]:
+
                 if re.match(
                     r"^A\.1\b",
                     line,
@@ -1374,7 +1798,10 @@ def extract_party_results(text):
                 ):
                     break
 
-                if "JUMLAH PINDAHAN" in line.upper():
+                if (
+                    "JUMLAH PINDAHAN"
+                    in line.upper()
+                ):
                     continue
 
                 nums = numbers_from_line(
@@ -1388,22 +1815,28 @@ def extract_party_results(text):
 
                 if (
                     expected_tps
-                    and len(tail)
+                    and
+                    len(tail)
                     >= expected_tps + 1
                 ):
                     break
 
             if (
                 expected_tps
-                and len(tail)
+                and
+                len(tail)
                 >= expected_tps + 1
             ):
+
                 final_vote = tail[
                     expected_tps
                 ]
 
             elif tail:
-                final_vote = tail[-1]
+
+                final_vote = tail[
+                    -1
+                ]
 
             else:
                 continue
@@ -1422,13 +1855,16 @@ def extract_party_results(text):
     cleaned = {}
 
     for row in results:
+
         cleaned[
             row["partai"]
         ] = row
 
     return [
         cleaned[key]
-        for key in sorted(cleaned)
+        for key in sorted(
+            cleaned
+        )
     ]
 
 
@@ -1436,100 +1872,235 @@ def extract_party_results(text):
 # PARTY MULTI HALAMAN
 # ============================================================
 
-def collect_row_numbers(all_lines, start_idx, boundary_idx):
-    """Ambil angka-angka yang berurutan (satu angka per baris) mulai dari
-    start_idx, berhenti begitu baris tidak murni angka, atau begitu mencapai
-    boundary_idx."""
+def collect_row_numbers(
+    all_lines,
+    start_idx,
+    boundary_idx
+):
+    """
+    Ambil angka berurutan setelah label.
+    """
+
     nums = []
+
     j = start_idx
+
     while j < boundary_idx:
-        line = all_lines[j].strip()
-        if re.fullmatch(r"[\d.,]+", line):
-            n = clean_number(line)
+
+        line = all_lines[
+            j
+        ].strip()
+
+        if re.fullmatch(
+            r"[\d.,]+",
+            line
+        ):
+
+            n = clean_number(
+                line
+            )
+
             if n is not None:
-                nums.append(n)
+                nums.append(
+                    n
+                )
+
             j += 1
+
         else:
             break
+
     return nums
 
 
-def extract_party_results_multipage(page_texts, expected_tps=0):
+def extract_party_results_multipage(
+    page_texts,
+    expected_tps=0
+):
     all_lines = []
+
     for text in page_texts:
-        normalized = normalize_text(text)
-        lines = [x.strip() for x in normalized.splitlines() if x.strip()]
-        all_lines.extend(lines)
+
+        normalized = normalize_text(
+            text
+        )
+
+        lines = [
+            x.strip()
+            for x in normalized.splitlines()
+            if x.strip()
+        ]
+
+        all_lines.extend(
+            lines
+        )
 
     if not all_lines:
         return []
 
     headings = []
-    for i, line in enumerate(all_lines):
-        number = detect_party_number(line)
+
+    for i, line in enumerate(
+        all_lines
+    ):
+
+        number = detect_party_number(
+            line
+        )
+
         if number is not None:
-            headings.append((i, number))
+
+            headings.append(
+                (
+                    i,
+                    number
+                )
+            )
 
     filtered_headings = []
+
     for item in headings:
+
         li, pn = item
+
         if filtered_headings:
-            pli, ppn = filtered_headings[-1]
-            if pn == ppn and li - pli <= 3:
+
+            pli, ppn = filtered_headings[
+                -1
+            ]
+
+            if (
+                pn == ppn
+                and
+                li - pli <= 3
+            ):
                 continue
-        filtered_headings.append(item)
+
+        filtered_headings.append(
+            item
+        )
+
     headings = filtered_headings
 
-    candidates = defaultdict(list)
+    candidates = defaultdict(
+        list
+    )
 
-    for pos, (start_i, party_number) in enumerate(headings):
-        next_heading_i = headings[pos + 1][0] if pos + 1 < len(headings) else len(all_lines)
+    for pos, (
+        start_i,
+        party_number
+    ) in enumerate(
+        headings
+    ):
 
-        # kumpulkan semua baris yang mengandung label "final"
+        next_heading_i = (
+            headings[pos + 1][0]
+            if pos + 1 < len(headings)
+            else len(all_lines)
+        )
+
         final_indices = []
-        for i in range(start_i, next_heading_i):
-            upper = all_lines[i].upper()
-            if ("JUMLAH AKHIR" in upper
-                or "JUMLAH SUARA SAH PARTAI POLITIK DAN CALON" in upper
-                or "JUMLAH SUARA SAH PARTAI POLITIK" in upper):
-                final_indices.append(i)
+
+        for i in range(
+            start_i,
+            next_heading_i
+        ):
+
+            upper = all_lines[
+                i
+            ].upper()
+
+            if (
+                "JUMLAH AKHIR"
+                in upper
+                or
+                "JUMLAH SUARA SAH PARTAI POLITIK DAN CALON"
+                in upper
+                or
+                "JUMLAH SUARA SAH PARTAI POLITIK"
+                in upper
+            ):
+
+                final_indices.append(
+                    i
+                )
 
         if not final_indices:
             continue
 
-        # pakai kemunculan label TERAKHIR di blok ini (lembar terakhir partai ini)
-        final_idx = final_indices[-1]
-        final_line = all_lines[final_idx]
+        final_idx = final_indices[
+            -1
+        ]
 
-        # jaga-jaga kalau ada angka nempel di baris label itu sendiri
-        same_line_nums = numbers_from_line(clean_party_final_line(final_line))
+        final_line = all_lines[
+            final_idx
+        ]
 
-        # kunci perbaikan: ambil SEMUA angka berurutan setelah label,
-        # bukan cuma angka pertama
-        row_nums = collect_row_numbers(all_lines, final_idx + 1, next_heading_i)
-        row_nums = same_line_nums + row_nums
+        same_line_nums = numbers_from_line(
+            clean_party_final_line(
+                final_line
+            )
+        )
 
-        # angka TERAKHIR pada baris itu = kolom "Jumlah Akhir"
-        # (kolom pertama = pindahan, kolom tengah = per-TPS, kolom akhir = total)
-        final_vote = row_nums[-1] if row_nums else None
+        row_nums = collect_row_numbers(
+            all_lines,
+            final_idx + 1,
+            next_heading_i
+        )
+
+        row_nums = (
+            same_line_nums
+            +
+            row_nums
+        )
+
+        final_vote = (
+            row_nums[-1]
+            if row_nums
+            else None
+        )
 
         if final_vote is not None:
-            candidates[party_number].append({
-                "partai": party_number,
-                "nama_partai": PARTY_NAMES.get(party_number, f"Partai {party_number}"),
-                "suara_akhir_partai": final_vote,
-                "_final_index": final_idx,
-            })
+
+            candidates[
+                party_number
+            ].append(
+                {
+                    "partai": party_number,
+                    "nama_partai": PARTY_NAMES.get(
+                        party_number,
+                        f"Partai {party_number}"
+                    ),
+                    "suara_akhir_partai": final_vote,
+                    "_final_index": final_idx,
+                }
+            )
 
     cleaned = {}
+
     for party_number, items in candidates.items():
+
         if not items:
             continue
-        # kalau ada beberapa kemunculan (lembar), ambil yang paling akhir
-        selected = sorted(items, key=lambda x: x.get("_final_index", -1))[-1]
-        cleaned[party_number] = selected
 
-    return [cleaned[key] for key in sorted(cleaned)]
+        selected = sorted(
+            items,
+            key=lambda x: x.get(
+                "_final_index",
+                -1
+            )
+        )[-1]
+
+        cleaned[
+            party_number
+        ] = selected
+
+    return [
+        cleaned[key]
+        for key in sorted(
+            cleaned
+        )
+    ]
 
 
 # ============================================================
@@ -1544,7 +2115,7 @@ def extract_party_results_from_page(
     """
     Membaca satu halaman.
 
-    Digunakan sebagai fallback dan kompatibilitas.
+    Fallback dan kompatibilitas.
     """
 
     page = doc.load_page(
@@ -1605,10 +2176,16 @@ def determine_village_start(
     for closing_page in closing_pages:
 
         if previous_closing is None:
+
             start = first_village_start
 
         else:
-            start = previous_closing + 1
+
+            start = (
+                previous_closing
+                +
+                1
+            )
 
         starts.append(
             start
@@ -1625,6 +2202,7 @@ def find_first_village_page(
     for index, text in enumerate(
         page_texts
     ):
+
         village = extract_village_name(
             text
         )
@@ -1647,7 +2225,9 @@ def build_village_blocks(
         return []
 
     closing_pages = sorted(
-        set(closing_pages)
+        set(
+            closing_pages
+        )
     )
 
     first_start = find_first_village_page(
@@ -1678,14 +2258,18 @@ def build_village_blocks(
                 if extract_village_name(
                     page_texts[p]
                 ):
+
                     start_page = p
 
             if start_page > closing_page:
                 start_page = first_start
 
         else:
+
             start_page = (
-                previous_end + 1
+                previous_end
+                +
+                1
             )
 
         village = None
@@ -1703,15 +2287,20 @@ def build_village_blocks(
             )
 
             if found:
+
                 village = found
                 break
 
         if village is None:
+
             village = extract_village_name(
-                page_texts[closing_page]
+                page_texts[
+                    closing_page
+                ]
             )
 
         if village is None:
+
             village = (
                 f"Kelurahan {i + 1}"
             )
@@ -1733,11 +2322,15 @@ def build_village_blocks(
 # WILAYAH
 # ============================================================
 
-def clean_region_value(value):
+def clean_region_value(
+    value
+):
     if value is None:
         return None
 
-    value = str(value).replace(
+    value = str(
+        value
+    ).replace(
         "\xa0",
         " "
     )
@@ -1785,7 +2378,9 @@ def _labeled_value(
     pattern
 ):
     m = re.search(
-        pattern + r"\s*[:.-]?\s*(.+)$",
+        pattern
+        +
+        r"\s*[:.-]?\s*(.+)$",
         line,
         re.I
     )
@@ -1799,7 +2394,9 @@ def _labeled_value(
     )
 
 
-def extract_region_fields(text):
+def extract_region_fields(
+    text
+):
     result = {
         "provinsi": None,
         "dapil": None,
@@ -1809,11 +2406,15 @@ def extract_region_fields(text):
 
     lines = [
         x.strip()
-        for x in normalize_text(text).splitlines()
+        for x in normalize_text(
+            text
+        ).splitlines()
         if x.strip()
     ]
 
-    for i, line in enumerate(lines):
+    for i, line in enumerate(
+        lines
+    ):
 
         upper = line.upper()
 
@@ -1832,13 +2433,16 @@ def extract_region_fields(text):
 
             if (
                 not value
-                and next_line.startswith(":")
+                and
+                next_line.startswith(":")
             ):
+
                 value = clean_region_value(
                     next_line.lstrip(": ")
                 )
 
             if value:
+
                 result[
                     "provinsi"
                 ] = value
@@ -1852,13 +2456,16 @@ def extract_region_fields(text):
 
             if (
                 not value
-                and next_line.startswith(":")
+                and
+                next_line.startswith(":")
             ):
+
                 value = clean_region_value(
                     next_line.lstrip(": ")
                 )
 
             if value:
+
                 result[
                     "dapil"
                 ] = value
@@ -1875,13 +2482,16 @@ def extract_region_fields(text):
 
             if (
                 not value
-                and next_line.startswith(":")
+                and
+                next_line.startswith(":")
             ):
+
                 value = clean_region_value(
                     next_line.lstrip(": ")
                 )
 
             if value:
+
                 result[
                     "kab_kota"
                 ] = value
@@ -1921,6 +2531,7 @@ def extract_region_fields(text):
                     "DPRD"
                 }
             ):
+
                 result[
                     "kecamatan"
                 ] = value
@@ -1941,6 +2552,7 @@ def extract_region_fields(text):
                         "DPRD"
                     }
                 ):
+
                     result[
                         "kecamatan"
                     ] = value
@@ -1996,7 +2608,11 @@ def build_tps_dataframe(
             rows.append(
                 {
                     "halaman": (
-                        block["end_page"] + 1
+                        block[
+                            "end_page"
+                        ]
+                        +
+                        1
                     ),
                     "provinsi": region.get(
                         "provinsi"
@@ -2107,13 +2723,19 @@ def build_ranges_dataframe(
     for block in blocks:
 
         start = (
-            block["start_page"]
-            + 1
+            block[
+                "start_page"
+            ]
+            +
+            1
         )
 
         end = (
-            block["end_page"]
-            + 1
+            block[
+                "end_page"
+            ]
+            +
+            1
         )
 
         closing_data = block.get(
@@ -2182,18 +2804,22 @@ def build_validation_dataframe(
 
         if (
             sah is not None
-            and tidak_sah is not None
+            and
+            tidak_sah is not None
         ):
+
             calculated = (
                 sah
-                + tidak_sah
+                +
+                tidak_sah
             )
 
         valid = (
             calculated == total
             if (
                 calculated is not None
-                and total is not None
+                and
+                total is not None
             )
             else False
         )
@@ -2257,6 +2883,7 @@ def build_summary_dataframe(
             )
 
             if party_number is not None:
+
                 unique_parties.add(
                     party_number
                 )
@@ -2319,7 +2946,12 @@ def process_pdf_local_engine(
     dpi_val=300
 ):
     """
-    Interface yang dipakai oleh 1_Pemindai_Data.py
+    Interface utama yang dipakai oleh processor.
+
+    progress_callback:
+        callback(progress, message)
+
+    progress berada pada 0.0 - 1.0.
     """
 
     if not file_bytes:
@@ -2346,586 +2978,705 @@ def process_pdf_local_engine(
     )
 
     if total_pages == 0:
+        doc.close()
+
         raise ValueError(
             "PDF tidak memiliki halaman."
         )
 
-    # ========================================================
-    # TAHAP 1
-    # BACA SEMUA HALAMAN
-    # ========================================================
+    try:
 
-    page_texts = []
+        # ====================================================
+        # TAHAP 1
+        # BACA SEMUA HALAMAN
+        # ====================================================
 
-    for page_index in range(
-        total_pages
-    ):
-
-        try:
-            text = ocr_page(
-                doc,
-                page_index,
-                dpi=180
-            )
-
-        except Exception:
-            text = ""
-
-        page_texts.append(
-            normalize_text(
-                text
-            )
-        )
-
-        if progress_callback:
-
-            report_progress(
-                progress_callback,
-                (
-                    (page_index + 1)
-                    / max(total_pages, 1)
-                    * 0.35
-                ),
-                f"Membaca halaman {page_index + 1}/{total_pages}"
-            )
-
-    # ========================================================
-    # TAHAP 2
-    # CARI HALAMAN AKHIR DESA
-    # ========================================================
-
-    closing_pages = []
-
-    for page_index, text in enumerate(
-        page_texts
-    ):
-
-        if is_closing_page(
-            text
-        ):
-            closing_pages.append(
-                page_index
-            )
-
-    # Hilangkan anchor yang terlalu berdekatan.
-
-    filtered_closing = []
-
-    for page in closing_pages:
-
-        if not filtered_closing:
-
-            filtered_closing.append(
-                page
-            )
-
-            continue
-
-        previous = filtered_closing[
-            -1
-        ]
-
-        if page - previous >= 2:
-            filtered_closing.append(
-                page
-            )
-
-    closing_pages = filtered_closing
-
-    # ========================================================
-    # TAHAP 3
-    # BANGUN BLOK DESA
-    # ========================================================
-
-    blocks = build_village_blocks(
-        page_texts,
-        closing_pages
-    )
-
-    # ========================================================
-    # TAHAP 4
-    # BACA HALAMAN AKHIR DESA
-    # ========================================================
-
-    for block_index, block in enumerate(
-        blocks
-    ):
-
-        closing_page = block[
-            "end_page"
-        ]
-
-        closing_text = page_texts[
-            closing_page
-        ]
-
-        # ----------------------------------------------------
-        # OCR ulang halaman akhir dengan DPI tinggi.
-        # ----------------------------------------------------
-
-        try:
-
-            closing_text_high = ocr_page(
-                doc,
-                closing_page,
-                dpi=dpi_val
-            )
-
-            if len(
-                closing_text_high
-            ) > len(
-                closing_text
-            ):
-                closing_text = (
-                    closing_text_high
-                )
-
-        except Exception:
-            pass
-
-        block[
-            "closing_text"
-        ] = closing_text
-
-        closing_data = extract_closing_vote_data(
-            closing_text
-        )
-
-        # ----------------------------------------------------
-        # PERBAIKAN:
-        # Jika suara_sah / suara_tidak_sah gagal terbaca lengkap
-        # dari teks linear (umum terjadi pada desa dengan TPS
-        # banyak, karena tabel terpecah 2 kolom), lengkapi/perbaiki
-        # dengan OCR berbasis koordinat (image_to_data) yang kebal
-        # terhadap masalah urutan baca linear tersebut.
-        # ----------------------------------------------------
-
-        closing_data = refine_closing_data_with_positional(
-            doc,
-            closing_page,
-            closing_data,
-            dpi=dpi_val,
-        )
-
-        block[
-            "closing_data"
-        ] = closing_data
-
-        # ----------------------------------------------------
-        # WILAYAH
-        # ----------------------------------------------------
-
-        region = {
-            "provinsi": None,
-            "dapil": None,
-            "kab_kota": None,
-            "kecamatan": None,
-        }
-
-        start = block[
-            "start_page"
-        ]
-
-        end = min(
-            block["end_page"] + 1,
-            len(page_texts)
-        )
+        page_texts = []
 
         for page_index in range(
-            start,
-            end
+            total_pages
         ):
 
-            found_region = extract_region_fields(
-                page_texts[page_index]
+            try:
+
+                text = ocr_page(
+                    doc,
+                    page_index,
+                    dpi=180
+                )
+
+            except Exception:
+
+                text = ""
+
+            page_texts.append(
+                normalize_text(
+                    text
+                )
+            )
+
+            if progress_callback:
+
+                report_progress(
+                    progress_callback,
+                    (
+                        (
+                            page_index
+                            +
+                            1
+                        )
+                        /
+                        max(
+                            total_pages,
+                            1
+                        )
+                        *
+                        0.35
+                    ),
+                    (
+                        f"Membaca halaman "
+                        f"{page_index + 1}/"
+                        f"{total_pages}"
+                    )
+                )
+
+        # ====================================================
+        # TAHAP 2
+        # CARI HALAMAN AKHIR DESA
+        # ====================================================
+
+        closing_pages = []
+
+        for page_index, text in enumerate(
+            page_texts
+        ):
+
+            if is_closing_page(
+                text
+            ):
+
+                closing_pages.append(
+                    page_index
+                )
+
+        # ----------------------------------------------------
+        # Hilangkan anchor yang terlalu berdekatan.
+        # ----------------------------------------------------
+
+        filtered_closing = []
+
+        for page in closing_pages:
+
+            if not filtered_closing:
+
+                filtered_closing.append(
+                    page
+                )
+
+                continue
+
+            previous = filtered_closing[
+                -1
+            ]
+
+            if (
+                page
+                -
+                previous
+                >= 2
+            ):
+
+                filtered_closing.append(
+                    page
+                )
+
+        closing_pages = filtered_closing
+
+        # ====================================================
+        # TAHAP 3
+        # BANGUN BLOK DESA
+        # ====================================================
+
+        blocks = build_village_blocks(
+            page_texts,
+            closing_pages
+        )
+
+        # ====================================================
+        # TAHAP 4
+        # BACA HALAMAN AKHIR DESA
+        # ====================================================
+
+        for block_index, block in enumerate(
+            blocks
+        ):
+
+            closing_page = block[
+                "end_page"
+            ]
+
+            closing_text = page_texts[
+                closing_page
+            ]
+
+            # ------------------------------------------------
+            # OCR ulang halaman akhir dengan DPI tinggi.
+            # ------------------------------------------------
+
+            try:
+
+                closing_text_high = ocr_page(
+                    doc,
+                    closing_page,
+                    dpi=dpi_val
+                )
+
+                # Hanya gunakan hasil high-DPI bila memang
+                # lebih panjang DAN tidak membuat Text Layer
+                # yang bagus tergantikan secara sembarangan.
+                #
+                # ocr_page sendiri sudah mempunyai proteksi
+                # Text Layer.
+
+                if len(
+                    closing_text_high
+                ) > len(
+                    closing_text
+                ):
+
+                    closing_text = (
+                        closing_text_high
+                    )
+
+            except Exception:
+                pass
+
+            block[
+                "closing_text"
+            ] = closing_text
+
+            closing_data = extract_closing_vote_data(
+                closing_text
+            )
+
+            # ------------------------------------------------
+            # POSITIONAL FALLBACK
+            # ------------------------------------------------
+
+            closing_data = (
+                refine_closing_data_with_positional(
+                    doc,
+                    closing_page,
+                    closing_data,
+                    dpi=dpi_val,
+                )
+            )
+
+            block[
+                "closing_data"
+            ] = closing_data
+
+            # ------------------------------------------------
+            # WILAYAH
+            # ------------------------------------------------
+
+            region = {
+                "provinsi": None,
+                "dapil": None,
+                "kab_kota": None,
+                "kecamatan": None,
+            }
+
+            start = block[
+                "start_page"
+            ]
+
+            end = min(
+                block[
+                    "end_page"
+                ]
+                +
+                1,
+                len(
+                    page_texts
+                )
+            )
+
+            for page_index in range(
+                start,
+                end
+            ):
+
+                found_region = (
+                    extract_region_fields(
+                        page_texts[
+                            page_index
+                        ]
+                    )
+                )
+
+                for key in region:
+
+                    if (
+                        not region.get(
+                            key
+                        )
+                        and
+                        found_region.get(
+                            key
+                        )
+                    ):
+
+                        region[
+                            key
+                        ] = found_region[
+                            key
+                        ]
+
+                if all(
+                    region.values()
+                ):
+                    break
+
+            closing_region = (
+                extract_region_fields(
+                    closing_text
+                )
             )
 
             for key in region:
 
-                if (
-                    not region.get(key)
-                    and found_region.get(key)
-                ):
-                    region[key] = found_region[
-                        key
-                    ]
-
-            if all(
-                region.values()
-            ):
-                break
-
-        closing_region = extract_region_fields(
-            closing_text
-        )
-
-        for key in region:
-
-            if not region.get(key):
-
-                region[key] = closing_region.get(
+                if not region.get(
                     key
+                ):
+
+                    region[
+                        key
+                    ] = closing_region.get(
+                        key
+                    )
+
+            block[
+                "region"
+            ] = region
+
+            # ------------------------------------------------
+            # NAMA DESA
+            # ------------------------------------------------
+
+            village = None
+
+            for page_index in range(
+                start,
+                min(
+                    start + 5,
+                    end
+                )
+            ):
+
+                village = extract_village_name(
+                    page_texts[
+                        page_index
+                    ]
                 )
 
-        block[
-            "region"
-        ] = region
-
-        # ----------------------------------------------------
-        # NAMA DESA
-        # ----------------------------------------------------
-
-        village = None
-
-        for page_index in range(
-            start,
-            min(
-                start + 5,
-                end
-            )
-        ):
-
-            village = extract_village_name(
-                page_texts[page_index]
-            )
+                if village:
+                    break
 
             if village:
-                break
 
-        if village:
-            block[
-                "village"
-            ] = village
+                block[
+                    "village"
+                ] = village
 
-        if progress_callback:
+            if progress_callback:
 
-            report_progress(
-                progress_callback,
-                (
-                    0.35
-                    +
+                report_progress(
+                    progress_callback,
                     (
-                        (block_index + 1)
-                        / max(len(blocks), 1)
-                        * 0.30
+                        0.35
+                        +
+                        (
+                            (
+                                block_index
+                                +
+                                1
+                            )
+                            /
+                            max(
+                                len(
+                                    blocks
+                                ),
+                                1
+                            )
+                            *
+                            0.30
+                        )
+                    ),
+                    (
+                        f"Membaca penutup desa "
+                        f"{block_index + 1}/"
+                        f"{len(blocks)}"
                     )
-                ),
-                f"Membaca penutup desa {block_index + 1}/{len(blocks)}"
-            )
+                )
 
-    # ========================================================
-    # TAHAP 5
-    # BACA SUARA PARTAI MULTI HALAMAN
-    # ========================================================
+        # ====================================================
+        # TAHAP 5
+        # BACA SUARA PARTAI MULTI HALAMAN
+        # ====================================================
 
-    for block_index, block in enumerate(
-        blocks
-    ):
-
-        start = block[
-            "start_page"
-        ]
-
-        end = block[
-            "end_page"
-        ]
-
-        closing_data = block.get(
-            "closing_data",
-            {}
-        )
-
-        expected_tps = len(
-            closing_data.get(
-                "tps",
-                []
-            )
-        )
-
-        # ----------------------------------------------------
-        # Ambil SEMUA teks dalam blok desa.
-        #
-        # Ini yang membuat partai dapat dibaca
-        # lintas halaman.
-        # ----------------------------------------------------
-
-        block_page_texts = []
-
-        for page_index in range(
-            start,
-            end + 1
+        for block_index, block in enumerate(
+            blocks
         ):
 
-            text = page_texts[
-                page_index
+            start = block[
+                "start_page"
             ]
 
-            # ------------------------------------------------
-            # Jika halaman terlalu pendek / kosong,
-            # baca ulang dengan DPI tinggi.
-            # ------------------------------------------------
+            end = block[
+                "end_page"
+            ]
 
-            if len(text.strip()) < 80:
-
-                try:
-
-                    better_text = ocr_page(
-                        doc,
-                        page_index,
-                        dpi=dpi_val
-                    )
-
-                    if len(
-                        better_text
-                    ) > len(text):
-                        text = better_text
-
-                except Exception:
-                    pass
-
-            block_page_texts.append(
-                text
+            closing_data = block.get(
+                "closing_data",
+                {}
             )
 
-        # ----------------------------------------------------
-        # Parser utama multi halaman.
-        # ----------------------------------------------------
+            expected_tps = len(
+                closing_data.get(
+                    "tps",
+                    []
+                )
+            )
 
-        party_results = extract_party_results_multipage(
-            block_page_texts,
-            expected_tps=expected_tps
-        )
+            # ------------------------------------------------
+            # Ambil semua teks dalam blok desa.
+            # ------------------------------------------------
 
-        # ----------------------------------------------------
-        # Jika belum mendapatkan 18 partai,
-        # lakukan fallback per halaman.
-        #
-        # Ini tidak menggantikan hasil multi halaman.
-        # Hanya menambahkan partai yang belum ditemukan.
-        # ----------------------------------------------------
+            block_page_texts = []
 
-        found_numbers = {
-            item.get("partai")
-            for item in party_results
-            if item.get("partai") is not None
-        }
-
-        if len(found_numbers) < 18:
-
-            fallback_results = []
-
-            for page_offset, page_text in enumerate(
-                block_page_texts
+            for page_index in range(
+                start,
+                end + 1
             ):
 
-                results = extract_party_results(
-                    page_text
+                text = page_texts[
+                    page_index
+                ]
+
+                # ------------------------------------------------
+                # Jika halaman terlalu pendek/kosong,
+                # baca ulang dengan DPI tinggi.
+                # ------------------------------------------------
+
+                if len(
+                    text.strip()
+                ) < 80:
+
+                    try:
+
+                        better_text = ocr_page(
+                            doc,
+                            page_index,
+                            dpi=dpi_val
+                        )
+
+                        if len(
+                            better_text
+                        ) > len(
+                            text
+                        ):
+
+                            text = (
+                                better_text
+                            )
+
+                    except Exception:
+                        pass
+
+                block_page_texts.append(
+                    text
                 )
 
-                if results:
-                    fallback_results.extend(
-                        results
+            # ------------------------------------------------
+            # Parser utama multi halaman.
+            # ------------------------------------------------
+
+            party_results = (
+                extract_party_results_multipage(
+                    block_page_texts,
+                    expected_tps=expected_tps
+                )
+            )
+
+            # ------------------------------------------------
+            # Fallback bila kurang dari 18 partai.
+            # ------------------------------------------------
+
+            found_numbers = {
+                item.get(
+                    "partai"
+                )
+                for item in party_results
+                if item.get(
+                    "partai"
+                ) is not None
+            }
+
+            if len(
+                found_numbers
+            ) < 18:
+
+                fallback_results = []
+
+                for page_offset, page_text in enumerate(
+                    block_page_texts
+                ):
+
+                    results = (
+                        extract_party_results(
+                            page_text
+                        )
                     )
 
-            for item in fallback_results:
+                    if results:
 
-                number = item.get(
+                        fallback_results.extend(
+                            results
+                        )
+
+                for item in fallback_results:
+
+                    number = item.get(
+                        "partai"
+                    )
+
+                    if (
+                        number is not None
+                        and
+                        number not in found_numbers
+                    ):
+
+                        party_results.append(
+                            item
+                        )
+
+                        found_numbers.add(
+                            number
+                        )
+
+            # ------------------------------------------------
+            # Hapus duplikat.
+            # ------------------------------------------------
+
+            party_map = {}
+
+            for item in party_results:
+
+                party_number = item.get(
                     "partai"
                 )
 
-                if (
-                    number is not None
-                    and
-                    number not in found_numbers
-                ):
-                    party_results.append(
-                        item
+                if party_number is None:
+                    continue
+
+                party_map[
+                    party_number
+                ] = item
+
+            party_results = [
+                party_map[key]
+                for key in sorted(
+                    party_map
+                )
+            ]
+
+            block[
+                "party_results"
+            ] = party_results
+
+            if progress_callback:
+
+                report_progress(
+                    progress_callback,
+                    (
+                        0.65
+                        +
+                        (
+                            (
+                                block_index
+                                +
+                                1
+                            )
+                            /
+                            max(
+                                len(
+                                    blocks
+                                ),
+                                1
+                            )
+                            *
+                            0.25
+                        )
+                    ),
+                    (
+                        f"Membaca suara partai "
+                        f"{block_index + 1}/"
+                        f"{len(blocks)}"
                     )
+                )
 
-                    found_numbers.add(
-                        number
-                    )
+        # ====================================================
+        # TAHAP 6
+        # HASIL AKHIR
+        # ====================================================
 
-        # ----------------------------------------------------
-        # Hapus duplikat.
-        # ----------------------------------------------------
+        summary_df = (
+            build_summary_dataframe(
+                file_name,
+                total_pages,
+                blocks
+            )
+        )
 
-        party_map = {}
+        ranges_df = (
+            build_ranges_dataframe(
+                blocks,
+                file_name
+            )
+        )
 
-        for item in party_results:
+        tps_df = (
+            build_tps_dataframe(
+                blocks
+            )
+        )
 
-            party_number = item.get(
-                "partai"
+        parties_df = (
+            build_party_dataframe(
+                blocks
+            )
+        )
+
+        validation_df = (
+            build_validation_dataframe(
+                blocks
+            )
+        )
+
+        raw_df = (
+            build_raw_dataframe(
+                file_name,
+                page_texts
+            )
+        )
+
+        # ====================================================
+        # DATABASE
+        # ====================================================
+
+        db_rows = []
+
+        for _, row in tps_df.iterrows():
+
+            db_rows.append(
+                {
+                    "provinsi": row.get(
+                        "provinsi"
+                    ),
+                    "dapil": row.get(
+                        "dapil"
+                    ),
+                    "kab_kota": row.get(
+                        "kab_kota"
+                    ),
+                    "kecamatan": row.get(
+                        "kecamatan"
+                    ),
+                    "kelurahan": row.get(
+                        "kelurahan"
+                    ),
+                    "tps": row.get(
+                        "tps"
+                    ),
+                    "suara_sah": row.get(
+                        "suara_sah"
+                    ),
+                    "suara_tidak_sah": row.get(
+                        "suara_tidak_sah"
+                    ),
+                    "total_suara": row.get(
+                        "total_suara"
+                    ),
+                    "file_name": file_name,
+                }
             )
 
-            if party_number is None:
-                continue
+        for _, row in parties_df.iterrows():
 
-            party_map[
-                party_number
-            ] = item
-
-        party_results = [
-            party_map[key]
-            for key in sorted(
-                party_map
+            db_rows.append(
+                {
+                    "provinsi": row.get(
+                        "provinsi"
+                    ),
+                    "dapil": row.get(
+                        "dapil"
+                    ),
+                    "kab_kota": row.get(
+                        "kab_kota"
+                    ),
+                    "kecamatan": row.get(
+                        "kecamatan"
+                    ),
+                    "kelurahan": row.get(
+                        "kelurahan"
+                    ),
+                    "tps": None,
+                    "partai": row.get(
+                        "partai"
+                    ),
+                    "nama_partai": row.get(
+                        "nama_partai"
+                    ),
+                    "suara_akhir_partai": row.get(
+                        "suara_akhir_partai"
+                    ),
+                    "file_name": file_name,
+                }
             )
-        ]
 
-        block[
-            "party_results"
-        ] = party_results
+        db_df = pd.DataFrame(
+            db_rows
+        )
+
+        # ====================================================
+        # PROGRESS SELESAI
+        # ====================================================
 
         if progress_callback:
 
             report_progress(
                 progress_callback,
-                (
-                    0.65
-                    +
-                    (
-                        (block_index + 1)
-                        / max(len(blocks), 1)
-                        * 0.25
-                    )
-                ),
-                f"Membaca suara partai {block_index + 1}/{len(blocks)}"
+                1.0,
+                "Selesai"
             )
 
-    # ========================================================
-    # TAHAP 6
-    # HASIL AKHIR
-    # ========================================================
+        return {
+            "summary": summary_df,
+            "db": db_df,
+            "ranges": ranges_df,
+            "tps": tps_df,
+            "parties": parties_df,
+            "validation": validation_df,
+            "raw": raw_df,
+        }
 
-    summary_df = build_summary_dataframe(
-        file_name,
-        total_pages,
-        blocks
-    )
+    finally:
 
-    ranges_df = build_ranges_dataframe(
-        blocks,
-        file_name
-    )
-
-    tps_df = build_tps_dataframe(
-        blocks
-    )
-
-    parties_df = build_party_dataframe(
-        blocks
-    )
-
-    validation_df = build_validation_dataframe(
-        blocks
-    )
-
-    raw_df = build_raw_dataframe(
-        file_name,
-        page_texts
-    )
-
-    # ========================================================
-    # DATABASE
-    # ========================================================
-
-    db_rows = []
-
-    for _, row in tps_df.iterrows():
-
-        db_rows.append(
-            {
-                "provinsi": row.get(
-                    "provinsi"
-                ),
-                "dapil": row.get(
-                    "dapil"
-                ),
-                "kab_kota": row.get(
-                    "kab_kota"
-                ),
-                "kecamatan": row.get(
-                    "kecamatan"
-                ),
-                "kelurahan": row.get(
-                    "kelurahan"
-                ),
-                "tps": row.get(
-                    "tps"
-                ),
-                "suara_sah": row.get(
-                    "suara_sah"
-                ),
-                "suara_tidak_sah": row.get(
-                    "suara_tidak_sah"
-                ),
-                "total_suara": row.get(
-                    "total_suara"
-                ),
-                "file_name": file_name,
-            }
-        )
-
-    for _, row in parties_df.iterrows():
-
-        db_rows.append(
-            {
-                "provinsi": row.get(
-                    "provinsi"
-                ),
-                "dapil": row.get(
-                    "dapil"
-                ),
-                "kab_kota": row.get(
-                    "kab_kota"
-                ),
-                "kecamatan": row.get(
-                    "kecamatan"
-                ),
-                "kelurahan": row.get(
-                    "kelurahan"
-                ),
-                "tps": None,
-                "partai": row.get(
-                    "partai"
-                ),
-                "nama_partai": row.get(
-                    "nama_partai"
-                ),
-                "suara_akhir_partai": row.get(
-                    "suara_akhir_partai"
-                ),
-                "file_name": file_name,
-            }
-        )
-
-    db_df = pd.DataFrame(
-        db_rows
-    )
-
-    # ========================================================
-    # PROGRESS SELESAI
-    # ========================================================
-
-    if progress_callback:
-
-        report_progress(
-            progress_callback,
-            1.0,
-            "Selesai"
-        )
-
-    doc.close()
-
-    return {
-        "summary": summary_df,
-        "db": db_df,
-        "ranges": ranges_df,
-        "tps": tps_df,
-        "parties": parties_df,
-        "validation": validation_df,
-        "raw": raw_df,
-    }
+        try:
+            doc.close()
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -2962,6 +3713,7 @@ def export_hasil_excel(
     output_path=None
 ):
     if output_path is None:
+
         output_path = (
             "hasil_pembacaan.xlsx"
         )
