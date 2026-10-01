@@ -15,3 +15,16 @@ pileg.db
 
 # Hasil pemindaian lokal
 scan_results/
+
+# Kredensial & token Google Drive — JANGAN pernah commit
+credentials.json
+token.json
+
+# Pengaturan lokal (path absolut, beda per komputer)
+gdrive_settings.json
+
+# Checkpoint & cadangan proses batch (data riwayat milik masing-masing orang)
+checkpoint_pemilu*.xlsx
+
+# Hasil Excel per kecamatan/dapil (bisa besar, data pemilu)
+hasil_pemilu/
