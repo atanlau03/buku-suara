@@ -25,6 +25,9 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from streamlit.runtime.scriptrunner import (
     add_script_run_ctx,
 )
@@ -56,12 +59,17 @@ from database import (
 
 
 # ============================================================
-# LOCAL OCR SAJA
+# LOCAL OCR + STATUS AI VISION (OPSIONAL)
 # ============================================================
 
-from local_ocr_engine import (
-    process_pdf_local_engine,
-)
+try:
+    from local_ocr_engine import (
+        process_pdf_local_engine,
+        AI_VISION_AVAILABLE,
+    )
+except ImportError:
+    from local_ocr_engine import process_pdf_local_engine
+    AI_VISION_AVAILABLE = False
 
 
 # ============================================================
@@ -135,6 +143,26 @@ if "scan_result" not in st.session_state:
     ] = None
 
 
+# ------------------------------------------------------------
+# FLAG ANTI-DUPLIKAT RERUN
+# ------------------------------------------------------------
+# Dipakai supaya st.rerun(scope="app") dari dalam fragment progress
+# hanya dipanggil SEKALI setiap kali sebuah proses selesai, bukan
+# berulang setiap 1 detik.
+#
+# CATATAN: st.fragment(run_every=...) HANYA me-rerun dirinya sendiri,
+# TIDAK me-rerun seluruh halaman. Tanpa flag + st.rerun(scope="app")
+# di bawah, section "Hasil Pembacaan Otomatis" tidak akan ter-render
+# otomatis setelah proses background selesai.
+# ------------------------------------------------------------
+
+if "result_ready_notified" not in st.session_state:
+
+    st.session_state[
+        "result_ready_notified"
+    ] = False
+
+
 # ============================================================
 # PENYIMPANAN HASIL PEMBACAAN
 # ============================================================
@@ -205,6 +233,7 @@ def worker_process(
         "parties": [],
         "validation": [],
         "raw": [],
+        "gabungan_dashboard": [],
     }
 
 
@@ -212,6 +241,21 @@ def worker_process(
         1,
         len(selected_files),
     )
+
+    # --------------------------------------------------------
+    # PERBAIKAN PENTING:
+    # Lacak file mana yang BERHASIL dan mana yang GAGAL secara
+    # eksplisit. Versi lama menimpa status["message"] dengan pesan
+    # sukses generik TANPA SYARAT di akhir fungsi ini -- artinya
+    # kalau sebuah file gagal diproses (exception di process_pdf_
+    # local_engine / save_scan_result), pesan error yang sempat
+    # di-set di blok except langsung TERTIMPA pesan "Selesai!" itu,
+    # sehingga pengguna mengira semua berhasil padahal sebenarnya
+    # GAGAL TOTAL dan arsipnya tidak pernah tersimpan.
+    # --------------------------------------------------------
+
+    succeeded_files = []
+    failed_files = []  # list of (file_name, error_message)
 
 
     for file_idx, file_name in enumerate(
@@ -353,14 +397,22 @@ def worker_process(
                     nama_file_asal=file_name,
                 )
 
+            succeeded_files.append(file_name)
+
 
         except Exception as error:
+
+            error_text = f"{type(error).__name__}: {error}"
+
+            failed_files.append(
+                (file_name, error_text)
+            )
 
             status[
                 "message"
             ] = (
                 f"Gagal memproses "
-                f"{file_name}: {error}"
+                f"{file_name}: {error_text}"
             )
 
 
@@ -388,7 +440,16 @@ def worker_process(
 
     # =========================================================
     # SELESAI
+    #
+    # PERBAIKAN: pesan akhir sekarang MENCERMINKAN hasil sebenarnya,
+    # bukan selalu "Selesai!" generik. Kalau ada file yang gagal,
+    # itu ditampilkan jelas -- termasuk pesan error aslinya -- supaya
+    # tidak menutupi kegagalan seperti sebelumnya.
     # =========================================================
+
+    st.session_state[
+        "result_ready_notified"
+    ] = False
 
     status[
         "progress"
@@ -398,13 +459,35 @@ def worker_process(
         "running"
     ] = False
 
-    status[
-        "message"
-    ] = (
-        "Selesai! "
-        "PDF telah dibaca dengan OCR lokal "
-        "dan data disimpan ke database serta arsip hasil pembacaan."
-    )
+    if failed_files and succeeded_files:
+
+        detail_gagal = "; ".join(
+            f"{name} ({err})" for name, err in failed_files
+        )
+
+        status["message"] = (
+            f"Selesai SEBAGIAN. Berhasil: {len(succeeded_files)} file "
+            f"({', '.join(succeeded_files)}). "
+            f"GAGAL: {len(failed_files)} file -> {detail_gagal}"
+        )
+
+    elif failed_files and not succeeded_files:
+
+        detail_gagal = "; ".join(
+            f"{name} ({err})" for name, err in failed_files
+        )
+
+        status["message"] = (
+            f"SEMUA file GAGAL diproses. Detail: {detail_gagal}"
+        )
+
+    else:
+
+        status["message"] = (
+            "Selesai! "
+            "PDF telah dibaca dengan OCR lokal "
+            "dan data disimpan ke database serta arsip hasil pembacaan."
+        )
 
 
 # ============================================================
@@ -416,11 +499,22 @@ st.subheader(
 )
 
 
-st.info(
-    "Mesin pembacaan menggunakan OCR lokal "
-    "Tesseract + analisis struktur dokumen. "
-    "Tidak menggunakan Gemini atau API AI."
-)
+if AI_VISION_AVAILABLE:
+
+    st.info(
+        "Mesin pembacaan menggunakan OCR lokal Tesseract + analisis "
+        "struktur dokumen sebagai metode utama. Fallback AI vision "
+        "(Gemini) AKTIF dan hanya dipakai untuk halaman yang gagal "
+        "dibaca Tesseract."
+    )
+
+else:
+
+    st.info(
+        "Mesin pembacaan menggunakan OCR lokal Tesseract + analisis "
+        "struktur dokumen. Fallback AI vision (Gemini) TIDAK aktif "
+        "saat ini (API key belum diset atau package belum terpasang)."
+    )
 
 
 dpi = st.slider(
@@ -443,10 +537,7 @@ st.divider()
 # INPUT PDF
 # ============================================================
 
-st.subheader(
-    "Input PDF"
-)
-
+st.subheader("Input PDF")
 
 uploaded = st.file_uploader(
     "Pilih PDF hasil rekap KPU",
@@ -455,128 +546,71 @@ uploaded = st.file_uploader(
     key="pdf_repo_uploader",
 )
 
-
 selected = []
 
-
 if not uploaded:
-
-    st.info(
-        "Upload satu atau beberapa PDF "
-        "untuk memulai."
-    )
-
+    st.info("Upload satu atau beberapa PDF untuk memulai.")
 else:
-
-    # ========================================================
-    # SIMPAN PDF
-    # ========================================================
-
+    # --------------------------------------------------------
+    # SIMPAN PDF ke folder upload
+    # --------------------------------------------------------
     for uploaded_file in uploaded:
+        file_path = UPLOAD_DIR / uploaded_file.name
+        with open(file_path, "wb") as output_file:
+            output_file.write(uploaded_file.getbuffer())
 
-        file_path = (
-            UPLOAD_DIR
-            / uploaded_file.name
-        )
-
-        with open(
-            file_path,
-            "wb",
-        ) as output_file:
-
-            output_file.write(
-                uploaded_file.getbuffer()
-            )
-
-
-    # ========================================================
-    # PILIH FILE
-    # ========================================================
-
+    # --------------------------------------------------------
+    # PILIH FILE yang akan diproses
+    # --------------------------------------------------------
     selected = st.multiselect(
         "File yang diproses",
-        [
-            uploaded_file.name
-            for uploaded_file
-            in uploaded
-        ],
-        default=[
-            uploaded_file.name
-            for uploaded_file
-            in uploaded
-        ],
+        [f.name for f in uploaded],
+        default=[f.name for f in uploaded],
     )
 
+    is_running = st.session_state["bg_status"]["running"]
 
-    is_running = st.session_state[
-        "bg_status"
-    ][
-        "running"
-    ]
-
-
-    # ========================================================
-    # MULAI
-    # ========================================================
-
+    # --------------------------------------------------------
+    # MULAI PROSES (satu-satunya tombol, lewat worker_process)
+    # --------------------------------------------------------
     if st.button(
         "Mulai Proses Otomatis",
         type="primary",
         use_container_width=True,
         disabled=is_running,
+        key="btn_mulai_proses_utama",
     ):
-
         if not selected:
-
-            st.warning(
-                "Pilih minimal satu file."
-            )
-
+            st.warning("Pilih minimal satu file.")
         else:
-
-            # ------------------------------------------------
-            # RESET STATUS
-            # ------------------------------------------------
-
-            st.session_state[
-                "bg_status"
-            ] = {
+            st.session_state["bg_status"] = {
                 "running": True,
                 "progress": 0,
-                "message": (
-                    "Memulai OCR lokal..."
-                ),
+                "message": "Memulai OCR lokal...",
             }
-
-            st.session_state[
-                "scan_result"
-            ] = None
-
-
-            # ------------------------------------------------
-            # THREAD
-            # ------------------------------------------------
+            st.session_state["scan_result"] = None
+            st.session_state["result_ready_notified"] = False
 
             thread = threading.Thread(
                 target=worker_process,
-                args=(
-                    selected,
-                    dpi,
-                ),
+                args=(selected, dpi),
                 daemon=True,
             )
-
-            add_script_run_ctx(
-                thread
-            )
-
+            add_script_run_ctx(thread)
             thread.start()
-
             st.rerun()
 
 
 # ============================================================
 # PROGRESS
+# ============================================================
+#
+# CATATAN PERBAIKAN BUG: st.fragment(run_every=...) HANYA me-rerun
+# fragment ini sendiri, TIDAK me-rerun seluruh halaman. Begitu
+# fragment ini mendeteksi status baru saja SELESAI (progress == 100
+# dan belum dinotifikasi), fragment memaksa rerun SELURUH aplikasi
+# lewat st.rerun(scope="app") supaya section "Hasil Pembacaan
+# Otomatis" di bawah ikut ter-render dengan data terbaru.
 # ============================================================
 
 @st.fragment(
@@ -621,8 +655,8 @@ def render_progress_section():
             )
 
             st.caption(
-                "PDF dibaca secara lokal "
-                "tanpa koneksi Gemini/API."
+                "PDF dibaca secara lokal terlebih dahulu; AI vision "
+                "hanya dipakai sebagai fallback bila diaktifkan."
             )
 
 
@@ -630,12 +664,31 @@ def render_progress_section():
         "progress"
     ) == 100:
 
-        st.success(
-            status.get(
-                "message",
-                "Selesai.",
+        message = status.get("message", "Selesai.")
+
+        if message.upper().startswith("SEMUA FILE GAGAL") or "GAGAL:" in message:
+            st.error(message)
+        elif "Selesai SEBAGIAN" in message:
+            st.warning(message)
+        else:
+            st.success(message)
+
+        # ----------------------------------------------------
+        # PICU RERUN SELURUH APP (HANYA SEKALI)
+        # ----------------------------------------------------
+
+        if not st.session_state.get(
+            "result_ready_notified",
+            False,
+        ):
+
+            st.session_state[
+                "result_ready_notified"
+            ] = True
+
+            st.rerun(
+                scope="app"
             )
-        )
 
 
 render_progress_section()
@@ -744,14 +797,8 @@ if result:
             "3. Suara Partai per TPS dan Rekap Kelurahan"
         )
 
-        # Tandai halaman yang hasil suara akhirnya perlu diperiksa ulang.
-        # Tanda ^ hanya ditampilkan pada halaman yang status validasinya
-        # bukan OK. Data asli di result tetap tidak diubah.
         parties_display = parties.copy()
 
-        # Tambahkan rekap suara kelurahan/desa ke setiap baris partai.
-        # Sumbernya adalah tabel ranges pada Point 2, sehingga nilai
-        # suara sah, tidak sah, dan total suara konsisten dengan rekap desa.
         village_vote_columns = [
             "kelurahan",
             "suara_sah",
@@ -766,8 +813,6 @@ if result:
             village_votes = ranges[village_vote_columns].copy()
             village_votes = village_votes.drop_duplicates(subset=["kelurahan"])
 
-            # Hapus kolom lama jika ternyata sudah ada di data parties,
-            # lalu ambil nilai resmi dari rekap kelurahan pada Point 2.
             for column in [
                 "suara_sah",
                 "suara_tidak_sah",
@@ -782,8 +827,6 @@ if result:
                 how="left",
             )
 
-        # Susun kolom agar informasi suara kelurahan langsung terlihat
-        # setelah suara akhir partai.
         preferred_columns = [
             "kelurahan",
             "nama_partai",

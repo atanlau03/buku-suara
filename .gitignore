@@ -28,3 +28,16 @@ checkpoint_pemilu*.xlsx
 
 # Hasil Excel per kecamatan/dapil (bisa besar, data pemilu)
 hasil_pemilu/
+
+# File eksperimen/debug pribadi
+auto_patch_*.py
+debug_page_*.py
+diagnose_ocr.py
+full_scan_with_ocr*.py
+gabung_checkpoint.py
+scan_all_pages.py
+test_ocr_*.py
+test_ocr_result_*.txt
+test_page_*.png
+local_ocr_engine.py.bak*
+ocr_debug_output.txt

@@ -13,8 +13,6 @@ Alur pembacaan:
 8. Menghasilkan DataFrame yang siap dipakai oleh Pemindai Data,
    Dashboard, dan Database.
 
-Tidak menggunakan Gemini atau AI eksternal.
-
 ------------------------------------------------------------------
 CATATAN PERBAIKAN:
 Untuk desa dengan jumlah TPS banyak (biasanya >= 16), tabel SUARA SAH /
@@ -61,6 +59,24 @@ Perbaikan: "JUMLAH AKHIR" dihapus dari daftar pemicu baris final.
 Sekarang HANYA "JUMLAH SUARA SAH PARTAI POLITIK DAN CALON" / "JUMLAH
 SUARA SAH PARTAI POLITIK" yang dipakai sebagai penanda, karena ini
 selalu merupakan baris DATA, bukan judul kolom.
+
+------------------------------------------------------------------
+CATATAN PERBAIKAN TAMBAHAN #2 (pelacakan halaman & sumber data):
+Setiap hasil suara akhir partai sekarang membawa informasi TAMBAHAN:
+
+  - "halaman": nomor halaman PDF (1-based) tempat angka itu dibaca.
+  - "status_validasi": "OK" kalau dibaca lewat parser teks (Tesseract /
+    text layer PDF), atau "PERLU DICEK" kalau dibaca lewat fallback AI
+    vision (Gemini). Ini BUKAN validasi matematika -- ini penanda
+    SUMBER data, supaya dashboard bisa menyorot angka yang berasal
+    dari AI (yang secara desain hanya dipakai saat Tesseract gagal,
+    sehingga lebih layak diperiksa ulang oleh manusia).
+  - "no_partai": salinan dari "partai" (nomor partai), disediakan
+    sebagai kolom terpisah untuk kebutuhan tampilan dashboard.
+
+Field-field ini TIDAK mengubah cara kerja ekstraksi sama sekali --
+cuma menambahkan metadata di setiap hasil supaya dashboard bisa
+menampilkan asal & keandalan tiap angka.
 ------------------------------------------------------------------
 """
 
@@ -76,14 +92,41 @@ import pytesseract
 
 from PIL import Image, ImageOps, ImageEnhance
 
+# ============================================================
+# FILTER NAMA KELURAHAN
+# ============================================================
+#
+# DIAMBIL DARI VERSI ALTERNATIF (dibuat oleh AI lain) -- fitur ini
+# genuinely berguna: mencegah teks header/label KPU (misal "DAFTAR
+# PEMILIH TETAP", "BERITA ACARA", "MODEL") tidak sengaja kebaca dan
+# dianggap sebagai nama kelurahan/desa, yang bisa terjadi kalau regex
+# ekstraksi nama desa kebetulan cocok dengan baris header di dekatnya.
+# ============================================================
+
+IGNORED_PATTERNS = [
+    "DAFTAR", "PEMILIH", "TETAP", "DOFTAR", "MODEL",
+    "BERITA ACARA", "RINCIAN", "PEROLEHAN", "SUARA",
+    "HAK PILIH", "KPU", "KABUPATEN", "KECAMATAN", "PROVINSI",
+    "LAMPIRAN", "REKAPITULASI", "DPRD", "DPR",
+]
+
+
+def is_valid_kelurahan(name):
+    """Cek apakah teks nama kelurahan valid dan bukan header/label KPU."""
+    if not name or len(name.strip()) < 3:
+        return False
+    upper_name = name.upper()
+    return not any(pattern in upper_name for pattern in IGNORED_PATTERNS)
+
 # ------------------------------------------------------------------
 # AI VISION FALLBACK (opsional)
 #
 # Modul ai_vision_fallback.py dipakai sebagai fallback TERAKHIR ketika
 # extract_closing_vote_data() (teks linear) DAN
-# extract_closing_votes_positional() (OCR koordinat) sama-sama gagal.
+# extract_closing_votes_positional() (OCR koordinat) sama-sama gagal,
+# atau saat suara akhir partai gagal dibaca lewat parser teks.
 #
-# Kalau file ai_vision_fallback.py tidak ada, atau ANTHROPIC_API_KEY
+# Kalau file ai_vision_fallback.py tidak ada, atau GEMINI_API_KEY
 # belum diset, engine tetap jalan normal seperti biasa TANPA AI -- ini
 # hanya lapisan tambahan opsional, bukan pengganti Tesseract.
 # ------------------------------------------------------------------
@@ -556,7 +599,7 @@ def extract_village_name(text):
                 " :.-"
             )
 
-            if len(value) >= 3:
+            if len(value) >= 3 and is_valid_kelurahan(value):
                 return value
 
     for line in lines:
@@ -569,7 +612,7 @@ def extract_village_name(text):
                 " :.-"
             )
 
-            if len(value) >= 3:
+            if len(value) >= 3 and is_valid_kelurahan(value):
                 return value
 
     return None
@@ -1091,77 +1134,126 @@ def refine_closing_data_with_positional(
 ):
     """
     Lengkapi / perbaiki jumlah_akhir_suara_sah, jumlah_akhir_suara_tidak_sah,
-    dan jumlah_akhir_total_suara dengan hasil OCR berbasis koordinat, HANYA
-    jika hasil dari extract_closing_vote_data() tidak lengkap (ada yang None).
+    dan jumlah_akhir_total_suara dengan hasil OCR berbasis koordinat dan/atau
+    AI vision, dalam DUA skenario:
 
-    Jika suara_sah dan suara_tidak_sah berhasil didapat ulang, total_suara
-    dihitung ulang dari penjumlahan keduanya -- ini juga memperbaiki kasus
-    di mana total_suara sebelumnya terisi angka yang KELIRU (misalnya
-    kebetulan sama dengan jumlah TPS, bukan total suara asli).
+      1. votes_incomplete -- ada nilai yang None (perilaku asli, sudah ada
+         sebelumnya): coba lengkapi lewat OCR posisional dulu, baru AI
+         vision kalau masih ada yang kosong.
+
+      2. math_mismatch (BARU, diadaptasi dari ide "check_needs_ai" versi
+         lain) -- semua nilai ADA tapi sah + tidak_sah != total. Ini
+         indikasi kuat salah satu (atau lebih) angka salah baca meski
+         terlihat "lengkap". Untuk kasus ini, OCR posisional dilewati
+         (karena bukan soal data hilang) dan langsung minta AI vision
+         sebagai "wasit" independen -- HANYA dipakai kalau AI berhasil
+         memberi pasangan sah & tidak_sah yang lengkap.
+
+    Status akhir tetap ditentukan oleh build_validation_dataframe() (cek
+    matematika independen) -- fungsi ini tidak pernah "memaksa" hasil
+    dianggap benar hanya karena berasal dari AI.
     """
 
-    votes_incomplete = (
-        closing_data.get("jumlah_akhir_suara_sah") is None
-        or closing_data.get("jumlah_akhir_suara_tidak_sah") is None
+    def is_incomplete(cd):
+        return (
+            cd.get("jumlah_akhir_suara_sah") is None
+            or cd.get("jumlah_akhir_suara_tidak_sah") is None
+        )
+
+    def math_ok(cd):
+        sah = cd.get("jumlah_akhir_suara_sah")
+        tidak = cd.get("jumlah_akhir_suara_tidak_sah")
+        total = cd.get("jumlah_akhir_total_suara")
+
+        if sah is None or tidak is None or total is None:
+            # Tidak bisa dicek di sini -- biarkan jalur "incomplete"
+            # yang menangani, bukan dianggap mismatch.
+            return True
+
+        return (sah + tidak) == total
+
+    votes_incomplete = is_incomplete(closing_data)
+    math_mismatch = (
+        not votes_incomplete
+        and not math_ok(closing_data)
     )
 
-    if not votes_incomplete:
+    if not votes_incomplete and not math_mismatch:
         return closing_data
 
-    try:
-        image = render_page(
-            doc,
-            page_index,
-            dpi=max(dpi, 300),
-        )
+    image = None
 
-        positional = extract_closing_votes_positional(
-            image
-        )
+    # --------------------------------------------------------
+    # SKENARIO 1: data belum lengkap -> coba OCR posisional dulu.
+    # --------------------------------------------------------
 
-    except Exception:
-        return closing_data
+    if votes_incomplete:
 
-    for key, pos_key in (
-        ("jumlah_akhir_suara_sah", "suara_sah"),
-        ("jumlah_akhir_suara_tidak_sah", "suara_tidak_sah"),
-        ("jumlah_akhir_total_suara", "total_suara"),
-    ):
+        try:
+            image = render_page(
+                doc,
+                page_index,
+                dpi=max(dpi, 300),
+            )
 
-        if positional.get(pos_key) is not None:
-            closing_data[key] = positional[pos_key]
+            positional = extract_closing_votes_positional(
+                image
+            )
 
-    # Hitung ulang total begitu sah & tidak sah sudah lengkap.
-    # Ini juga menggantikan total lama yang mungkin keliru.
+        except Exception:
+            positional = None
 
-    sah = closing_data.get("jumlah_akhir_suara_sah")
-    tidak = closing_data.get("jumlah_akhir_suara_tidak_sah")
+        if positional:
 
-    if sah is not None and tidak is not None:
+            for key, pos_key in (
+                ("jumlah_akhir_suara_sah", "suara_sah"),
+                ("jumlah_akhir_suara_tidak_sah", "suara_tidak_sah"),
+                ("jumlah_akhir_total_suara", "total_suara"),
+            ):
 
-        calculated_total = sah + tidak
+                if positional.get(pos_key) is not None:
+                    closing_data[key] = positional[pos_key]
 
-        if closing_data.get("jumlah_akhir_total_suara") != calculated_total:
-            closing_data["jumlah_akhir_total_suara"] = calculated_total
+        # Hitung ulang total begitu sah & tidak sah sudah lengkap.
+        # Ini juga menggantikan total lama yang mungkin keliru.
+
+        sah = closing_data.get("jumlah_akhir_suara_sah")
+        tidak = closing_data.get("jumlah_akhir_suara_tidak_sah")
+
+        if sah is not None and tidak is not None:
+
+            calculated_total = sah + tidak
+
+            if closing_data.get("jumlah_akhir_total_suara") != calculated_total:
+                closing_data["jumlah_akhir_total_suara"] = calculated_total
 
     # ----------------------------------------------------------
     # FALLBACK TERAKHIR: AI VISION
     #
-    # Kalau OCR posisional MASIH belum melengkapi suara_sah / tidak_sah
-    # (biasa terjadi pada scan resolusi sangat rendah), coba minta
-    # Claude vision membacanya. Hanya jalan kalau AI_VISION_AVAILABLE
-    # (package + API key terpasang) -- kalau tidak, baris ini dilewati
-    # otomatis dan closing_data dikembalikan apa adanya seperti sebelumnya.
+    # Dipanggil untuk DUA kasus:
+    #   - masih ada nilai None setelah OCR posisional (skenario 1), ATAU
+    #   - data lengkap tapi matematikanya tidak cocok (skenario 2, baru).
+    #
+    # Hanya jalan kalau AI_VISION_AVAILABLE (package + API key terpasang)
+    # -- kalau tidak, closing_data dikembalikan apa adanya.
     # ----------------------------------------------------------
 
-    still_incomplete = (
-        closing_data.get("jumlah_akhir_suara_sah") is None
-        or closing_data.get("jumlah_akhir_suara_tidak_sah") is None
+    still_incomplete = is_incomplete(closing_data)
+    still_mismatch = (
+        not still_incomplete
+        and not math_ok(closing_data)
     )
 
-    if still_incomplete and AI_VISION_AVAILABLE:
+    if (still_incomplete or still_mismatch) and AI_VISION_AVAILABLE:
 
         try:
+            if image is None:
+                image = render_page(
+                    doc,
+                    page_index,
+                    dpi=max(dpi, 300),
+                )
+
             expected_tps = len(closing_data.get("tps", []))
 
             ai_result = extract_closing_data_with_ai(
@@ -1174,11 +1266,24 @@ def refine_closing_data_with_positional(
 
         if ai_result:
 
-            if closing_data.get("jumlah_akhir_suara_sah") is None:
-                closing_data["jumlah_akhir_suara_sah"] = ai_result.get("suara_sah")
+            if still_incomplete:
 
-            if closing_data.get("jumlah_akhir_suara_tidak_sah") is None:
-                closing_data["jumlah_akhir_suara_tidak_sah"] = ai_result.get("suara_tidak_sah")
+                if closing_data.get("jumlah_akhir_suara_sah") is None:
+                    closing_data["jumlah_akhir_suara_sah"] = ai_result.get("suara_sah")
+
+                if closing_data.get("jumlah_akhir_suara_tidak_sah") is None:
+                    closing_data["jumlah_akhir_suara_tidak_sah"] = ai_result.get("suara_tidak_sah")
+
+            else:
+                # Kasus mismatch matematika: pakai AI sebagai wasit
+                # independen, HANYA jika AI memberi pasangan sah &
+                # tidak_sah yang lengkap (bukan menebak sebagian).
+                ai_sah = ai_result.get("suara_sah")
+                ai_tidak = ai_result.get("suara_tidak_sah")
+
+                if ai_sah is not None and ai_tidak is not None:
+                    closing_data["jumlah_akhir_suara_sah"] = ai_sah
+                    closing_data["jumlah_akhir_suara_tidak_sah"] = ai_tidak
 
             sah = closing_data.get("jumlah_akhir_suara_sah")
             tidak = closing_data.get("jumlah_akhir_suara_tidak_sah")
@@ -1186,7 +1291,10 @@ def refine_closing_data_with_positional(
             if sah is not None and tidak is not None:
                 closing_data["jumlah_akhir_total_suara"] = sah + tidak
 
-            elif ai_result.get("total_suara") is not None:
+            elif (
+                still_incomplete
+                and ai_result.get("total_suara") is not None
+            ):
                 closing_data["jumlah_akhir_total_suara"] = ai_result.get("total_suara")
 
     return closing_data
@@ -1549,12 +1657,31 @@ def collect_row_numbers(all_lines, start_idx, boundary_idx):
     return nums
 
 
-def extract_party_results_multipage(page_texts, expected_tps=0):
+def extract_party_results_multipage(page_texts, expected_tps=0, page_numbers=None):
+    """
+    page_numbers: opsional, list nomor halaman PDF (1-based) yang sejajar
+    posisinya dengan page_texts (page_numbers[i] adalah nomor halaman asli
+    untuk page_texts[i]). Dipakai untuk melampirkan info "halaman" pada
+    setiap hasil suara partai -- supaya dashboard tahu angka itu dibaca
+    dari halaman berapa. Kalau tidak diberikan, "halaman" dihitung dari
+    urutan relatif (index + 1) sebagai fallback.
+    """
+
     all_lines = []
-    for text in page_texts:
+    line_page = []  # nomor halaman (1-based) untuk tiap entri di all_lines
+
+    for offset, text in enumerate(page_texts):
         normalized = normalize_text(text)
         lines = [x.strip() for x in normalized.splitlines() if x.strip()]
+
+        page_no = (
+            page_numbers[offset]
+            if page_numbers and offset < len(page_numbers)
+            else offset + 1
+        )
+
         all_lines.extend(lines)
+        line_page.extend([page_no] * len(lines))
 
     if not all_lines:
         return []
@@ -1629,6 +1756,8 @@ def extract_party_results_multipage(page_texts, expected_tps=0):
                 "nama_partai": PARTY_NAMES.get(party_number, f"Partai {party_number}"),
                 "suara_akhir_partai": final_vote,
                 "_final_index": final_idx,
+                "halaman": line_page[final_idx],
+                "status_validasi": "OK",
             })
 
     cleaned = {}
@@ -2150,6 +2279,57 @@ def build_tps_dataframe(
 # ============================================================
 # DATAFRAME PARTY
 # ============================================================
+def build_dashboard_export_dataframe(blocks, file_name):
+    """
+    Sheet gabungan siap pakai: suara partai + rekap desa, format sama
+    dengan tampilan "Suara Partai dan Rekap Kelurahan" di Dashboard,
+    tapi ^ ditaruh langsung di nilai suara_sah / suara_tidak_sah /
+    total_suara yang belum terbaca, bukan di kolom halaman.
+    """
+
+    rows = []
+
+    for block in blocks:
+
+        region = block.get("region", {})
+
+        closing_data = block.get("closing_data", {})
+
+        sah = closing_data.get("jumlah_akhir_suara_sah")
+        tidak_sah = closing_data.get("jumlah_akhir_suara_tidak_sah")
+        total = closing_data.get("jumlah_akhir_total_suara")
+
+        for item in block.get("party_results", []):
+
+            rows.append(
+                {
+                    "nama_pdf": file_name,
+                    "nama_file": file_name,
+                    "kelurahan": block["village"],
+                    "no_partai": item.get("partai"),
+                    "nama_partai": item.get("nama_partai"),
+                    "suara_akhir_partai": item.get("suara_akhir_partai"),
+                    "suara_sah": sah if sah is not None else "^",
+                    "suara_tidak_sah": (
+                        tidak_sah if tidak_sah is not None else "^"
+                    ),
+                    "total_suara": total if total is not None else "^",
+                    "provinsi": region.get("provinsi"),
+                    "dapil": region.get("dapil"),
+                    "kab_kota": region.get("kab_kota"),
+                    "kecamatan": region.get("kecamatan"),
+                }
+            )
+
+    columns = [
+        "nama_pdf", "nama_file", "kelurahan", "no_partai", "nama_partai",
+        "suara_akhir_partai", "suara_sah", "suara_tidak_sah", "total_suara",
+        "provinsi", "dapil", "kab_kota", "kecamatan",
+    ]
+
+    return pd.DataFrame(rows, columns=columns)
+
+
 
 def build_party_dataframe(
     blocks
@@ -2160,6 +2340,11 @@ def build_party_dataframe(
 
         region = block.get(
             "region",
+            {}
+        )
+
+        closing_data = block.get(
+            "closing_data",
             {}
         )
 
@@ -2175,6 +2360,9 @@ def build_party_dataframe(
                     "kelurahan": block[
                         "village"
                     ],
+                    "no_partai": item.get(
+                        "partai"
+                    ),
                     "partai": item.get(
                         "partai"
                     ),
@@ -2183,6 +2371,22 @@ def build_party_dataframe(
                     ),
                     "suara_akhir_partai": item.get(
                         "suara_akhir_partai"
+                    ),
+                    "suara_sah": closing_data.get(
+                        "jumlah_akhir_suara_sah"
+                    ),
+                    "suara_tidak_sah": closing_data.get(
+                        "jumlah_akhir_suara_tidak_sah"
+                    ),
+                    "total_suara": closing_data.get(
+                        "jumlah_akhir_total_suara"
+                    ),
+                    "halaman": item.get(
+                        "halaman"
+                    ),
+                    "status_validasi": item.get(
+                        "status_validasi",
+                        "OK",
                     ),
                     "provinsi": region.get(
                         "provinsi"
@@ -2202,8 +2406,6 @@ def build_party_dataframe(
     return pd.DataFrame(
         rows
     )
-
-
 # ============================================================
 # RANGE DESA
 # ============================================================
@@ -2417,6 +2619,11 @@ def build_raw_dataframe(
         rows
     )
 
+
+def _clean_db_value(x):
+    if x is None or pd.isna(x) or not str(x).strip():
+        return "-"
+    return str(x).strip()
 
 # ============================================================
 # FUNGSI UTAMA
@@ -2760,6 +2967,7 @@ def process_pdf_local_engine(
         # ----------------------------------------------------
 
         block_page_texts = []
+        block_page_numbers = []
 
         for page_index in range(
             start,
@@ -2797,13 +3005,18 @@ def process_pdf_local_engine(
                 text
             )
 
+            block_page_numbers.append(
+                page_index + 1
+            )
+
         # ----------------------------------------------------
         # Parser utama multi halaman.
         # ----------------------------------------------------
 
         party_results = extract_party_results_multipage(
             block_page_texts,
-            expected_tps=expected_tps
+            expected_tps=expected_tps,
+            page_numbers=block_page_numbers,
         )
 
         # ----------------------------------------------------
@@ -2833,6 +3046,13 @@ def process_pdf_local_engine(
                 )
 
                 if results:
+
+                    page_no = block_page_numbers[page_offset]
+
+                    for item in results:
+                        item["halaman"] = page_no
+                        item["status_validasi"] = "OK"
+
                     fallback_results.extend(
                         results
                     )
@@ -2860,11 +3080,15 @@ def process_pdf_local_engine(
         # FALLBACK TERAKHIR: AI VISION
         #
         # Kalau MASIH belum lengkap 18 partai setelah parser teks
-        # (multi halaman + per halaman), coba minta Claude vision
+        # (multi halaman + per halaman), coba minta Gemini vision
         # membaca halaman-halaman blok desa ini. Hanya jalan kalau
         # AI_VISION_AVAILABLE (package + API key terpasang), dan
         # hanya untuk halaman yang belum menghasilkan partai baru --
         # supaya panggilan API tetap minim.
+        #
+        # Hasil dari jalur ini diberi status_validasi="PERLU DICEK"
+        # (bukan berarti salah -- tapi sumbernya AI, bukan pembacaan
+        # teks langsung, jadi lebih layak diperiksa ulang manusia).
         # ----------------------------------------------------
 
         if len(found_numbers) < 18 and AI_VISION_AVAILABLE:
@@ -2897,6 +3121,9 @@ def process_pdf_local_engine(
                         number is not None
                         and number not in found_numbers
                     ):
+                        item["halaman"] = page_index + 1
+                        item["status_validasi"] = "PERLU DICEK"
+
                         party_results.append(item)
                         found_numbers.add(number)
 
@@ -2979,77 +3206,34 @@ def process_pdf_local_engine(
         page_texts
     )
 
+    dashboard_export_df = build_dashboard_export_dataframe(
+        blocks,
+        file_name
+    )
     # ========================================================
     # DATABASE
     # ========================================================
 
     db_rows = []
 
-    for _, row in tps_df.iterrows():
-
-        db_rows.append(
-            {
-                "provinsi": row.get(
-                    "provinsi"
-                ),
-                "dapil": row.get(
-                    "dapil"
-                ),
-                "kab_kota": row.get(
-                    "kab_kota"
-                ),
-                "kecamatan": row.get(
-                    "kecamatan"
-                ),
-                "kelurahan": row.get(
-                    "kelurahan"
-                ),
-                "tps": row.get(
-                    "tps"
-                ),
-                "suara_sah": row.get(
-                    "suara_sah"
-                ),
-                "suara_tidak_sah": row.get(
-                    "suara_tidak_sah"
-                ),
-                "total_suara": row.get(
-                    "total_suara"
-                ),
-                "file_name": file_name,
-            }
-        )
-
     for _, row in parties_df.iterrows():
 
+        suara = row.get("suara_akhir_partai")
+
+        if pd.isna(suara):
+            continue
+
         db_rows.append(
             {
-                "provinsi": row.get(
-                    "provinsi"
-                ),
-                "dapil": row.get(
-                    "dapil"
-                ),
-                "kab_kota": row.get(
-                    "kab_kota"
-                ),
-                "kecamatan": row.get(
-                    "kecamatan"
-                ),
-                "kelurahan": row.get(
-                    "kelurahan"
-                ),
-                "tps": None,
-                "partai": row.get(
-                    "partai"
-                ),
-                "nama_partai": row.get(
-                    "nama_partai"
-                ),
-                "suara_akhir_partai": row.get(
-                    "suara_akhir_partai"
-                ),
-                "file_name": file_name,
+                "provinsi": _clean_db_value(row.get("provinsi")),
+                "dapil": _clean_db_value(row.get("dapil")),
+                "kab_kota": _clean_db_value(row.get("kab_kota")),
+                "kecamatan": _clean_db_value(row.get("kecamatan")),
+                "kelurahan": _clean_db_value(row.get("kelurahan")),
+                "tps": "REKAP DESA",
+                "partai": row.get("nama_partai"),
+                "nomor_urut_partai": row.get("partai"),
+                "jumlah_suara": int(suara),
             }
         )
 
@@ -3057,6 +3241,7 @@ def process_pdf_local_engine(
         db_rows
     )
 
+    
     # ========================================================
     # PROGRESS SELESAI
     # ========================================================
@@ -3079,6 +3264,7 @@ def process_pdf_local_engine(
         "parties": parties_df,
         "validation": validation_df,
         "raw": raw_df,
+        "gabungan_dashboard": dashboard_export_df,
     }
 
 
@@ -3095,8 +3281,6 @@ def proses_pdf_batch_hybrid(
 ):
     """
     Alias kompatibilitas.
-
-    Tidak menggunakan Gemini atau AI.
     """
 
     return process_pdf_local_engine(
