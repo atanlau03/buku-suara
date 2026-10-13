@@ -774,6 +774,27 @@ def process_job(source, job, out_dir, dpi=300, log=_log, on_result=None):
     except Exception as e:
         return finish(STATUS_ERROR, f"Engine error: {type(e).__name__}: {e}"[:300])
 
+    # Lengkapi wilayah yang gagal terbaca dari teks PDF, pakai nama folder Drive.
+    kosong = {"", "-", "none", "nan"}
+
+    for sheet in ("tps", "parties", "gabungan_dashboard", "db"):
+        df = hasil.get(sheet)
+
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+
+        for col, nilai in (
+            ("dapil", job.dapil),
+            ("kab_kota", job.kabupaten),
+            ("kecamatan", job.kecamatan),
+        ):
+            if col in df.columns:
+                df[col] = df[col].apply(
+                    lambda v, n=nilai: n
+                    if v is None or pd.isna(v) or str(v).strip().lower() in kosong
+                    else v
+                )
+
     quality = assess_result(hasil)
     row.update(quality)
 

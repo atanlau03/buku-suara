@@ -59,6 +59,15 @@ if str(BASE_DIR) not in sys.path:
         str(BASE_DIR),
     )
 
+from ui_theme import apply_theme, header
+
+st.set_page_config(
+    page_title="Buku Suara - Ambil Data dari Google Drive",
+    layout="wide",
+)
+
+
+
 
 # ============================================================
 # DATABASE + MODUL BATCH
@@ -68,6 +77,8 @@ from database import (
     import_dataframe,
     init_db,
 )
+
+from scan_archive import save_scan_result
 
 from gdrive_batch import (
     DriveSource,
@@ -107,27 +118,19 @@ XLSX_MIME = (
 # ============================================================
 # PAGE CONFIG
 # ============================================================
+from ui_theme import apply_theme, header
 
 st.set_page_config(
     page_title="Buku Suara - Ambil Data dari Google Drive",
     layout="wide",
 )
 
+apply_theme()
 
-# ============================================================
-# HEADER
-# ============================================================
-
-st.title(
-    "Ambil Data dari Google Drive"
+header(
+    "Ambil Data dari Google Drive",
+    "Drive → Dapil → Kabupaten → Kecamatan → OCR Lokal → Database",
 )
-
-st.caption(
-    "Drive → Dapil → Kabupaten → Kecamatan → Cek Text Layer → "
-    "OCR Lokal → Database → Checkpoint"
-)
-
-
 # ============================================================
 # PENGATURAN PERMANEN
 #
@@ -256,41 +259,6 @@ if "gd_status" not in st.session_state:
 if "gd_notified" not in st.session_state:
     st.session_state["gd_notified"] = False
 
-
-# ============================================================
-# ARSIP HASIL (format sama dengan 1_Pemindai_Data.py)
-# ============================================================
-
-def _archive_name(file_name):
-    stem = Path(file_name).stem
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
-    return (safe or "hasil_scan") + ".json"
-
-
-def save_scan_result(file_name, result, dpi_val):
-    """Simpan hasil pembacaan agar bisa dibuka kembali dari Dashboard."""
-    archive = {
-        "nama_file_pdf": file_name,
-        "waktu_scan": pd.Timestamp.now().isoformat(),
-        "dpi": int(dpi_val),
-        "hasil": {},
-    }
-
-    for key, value in result.items():
-        if isinstance(value, pd.DataFrame):
-            archive["hasil"][key] = json.loads(
-                value.to_json(orient="records", date_format="iso")
-            )
-        else:
-            archive["hasil"][key] = value
-
-    output_path = SCAN_RESULTS_DIR / _archive_name(file_name)
-    temp_path = output_path.with_suffix(".tmp")
-    temp_path.write_text(
-        json.dumps(archive, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temp_path.replace(output_path)
 
 
 # ============================================================
@@ -424,36 +392,41 @@ st.subheader(
     "Sumber Data"
 )
 
-tipe = st.radio(
-    "Ambil data dari",
-    ["Google Drive", "Folder lokal"],
-    horizontal=True,
-    key="gd_source_type",
-    help=(
-        "Pilih 'Folder lokal' bila folder Drive sudah diunduh atau "
-        "memakai Google Drive for Desktop."
-    ),
-)
+with st.expander(
+    "Pengaturan sumber data",
+    expanded=not st.session_state.get("gd_root_drive", "").strip(),
+):
 
-use_drive = tipe == "Google Drive"
+    tipe = st.radio(
+        "Ambil data dari",
+        ["Google Drive", "Folder lokal"],
+        horizontal=True,
+        key="gd_source_type",
+        help=(
+            "Pilih 'Folder lokal' bila folder Drive sudah diunduh atau "
+            "memakai Google Drive for Desktop."
+        ),
+    )
 
-root_drive = st.text_input(
-    "Folder induk Google Drive (URL atau ID)",
-    key="gd_root_drive",
-    disabled=not use_drive,
-    help=(
-        "Folder yang berisi folder-folder dapil. Tersimpan otomatis, "
-        "jadi cukup diisi sekali."
-    ),
-)
+    use_drive = tipe == "Google Drive"
 
-root_local = st.text_input(
-    "Folder lokal induk (berisi folder-folder dapil)",
-    key="gd_root_local",
-    disabled=use_drive,
-)
+    root_drive = st.text_input(
+        "Folder induk Google Drive (URL atau ID)",
+        key="gd_root_drive",
+        disabled=not use_drive,
+        help=(
+            "Folder yang berisi folder-folder dapil. Tersimpan otomatis, "
+            "jadi cukup diisi sekali."
+        ),
+    )
 
-with st.expander("Autentikasi Google Drive"):
+    root_local = st.text_input(
+        "Folder lokal induk (berisi folder-folder dapil)",
+        key="gd_root_local",
+        disabled=use_drive,
+    )
+
+    st.markdown("**Autentikasi Google Drive**")
 
     credentials_path = st.text_input(
         "File credentials OAuth",
@@ -481,6 +454,7 @@ with st.expander("Autentikasi Google Drive"):
         + ". Langkah pembuatan credentials ada di bagian atas gdrive_batch.py."
     )
 
+
 root_text = root_drive if use_drive else root_local
 
 base_cfg = {
@@ -496,7 +470,6 @@ st.caption(
     "Link folder, lokasi hasil, dan daftar dapil tersimpan otomatis "
     f"di {SETTINGS_PATH.name}."
 )
-
 
 if st.button(
     "Muat daftar dapil",
@@ -956,14 +929,14 @@ def summarize_history(checkpoint_df, fallback_out_dir):
 
 def render_dapil_report(dapil, group, fallback_out_dir):
 
-    rows_df = normalize_rows(group.to_dict("records"))
+    tampil_df = normalize_rows(group.to_dict("records"))
 
-    counts = rows_df["status"].value_counts()
+    counts = tampil_df["status"].value_counts()
 
     review_mask = (
-        rows_df.get(
+        tampil_df.get(
             "kelurahan_perlu_cek",
-            pd.Series(0, index=rows_df.index),
+            pd.Series(0, index=tampil_df.index),
         )
         .fillna(0)
         .gt(0)
@@ -984,7 +957,7 @@ def render_dapil_report(dapil, group, fallback_out_dir):
 
     st.dataframe(
         show_columns(
-            rows_df,
+            tampil_df,
             [
                 "kabupaten",
                 "kecamatan",
@@ -1003,8 +976,8 @@ def render_dapil_report(dapil, group, fallback_out_dir):
     )
 
 
-    hard = rows_df[
-        rows_df["status"].isin([STATUS_SKIP, STATUS_ERROR])
+    hard = tampil_df[
+        tampil_df["status"].isin([STATUS_SKIP, STATUS_ERROR])
     ]
 
     if not hard.empty:
@@ -1038,7 +1011,7 @@ def render_dapil_report(dapil, group, fallback_out_dir):
         )
 
 
-    check = rows_df[review_mask]
+    check = tampil_df[review_mask]
 
     if not check.empty:
 
@@ -1171,9 +1144,23 @@ else:
 
     history = summarize_history(checkpoint_df, out_dir)
 
+    only_issue = st.checkbox(
+        "Tampilkan hanya dapil yang perlu perhatian (dilewati / error / perlu dicek)",
+        key="gd_only_issue",
+    )
+
+    shown = history
+
+    if only_issue:
+        shown = history[
+            (history["dilewati"] > 0)
+            | (history["error"] > 0)
+            | (history["perlu_dicek"] > 0)
+        ]
+
     st.dataframe(
-        history,
-        width="stretch",
+        shown,
+        use_container_width=True,
         hide_index=True,
     )
 

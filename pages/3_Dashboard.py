@@ -1,6 +1,5 @@
+import io
 import base64
-import json
-import re
 from pathlib import Path
 
 import pandas as pd
@@ -12,6 +11,9 @@ from database import (
     init_db,
     list_uploaded_files,
 )
+
+from scan_archive import archive_name, load_saved_result, SCAN_RESULTS_DIR
+from results_view import render_results
 
 from ui_theme import (
     apply_theme,
@@ -29,48 +31,16 @@ init_db()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOAD_DIR = BASE_DIR / "uploaded_pdfs"
-SCAN_RESULTS_DIR = BASE_DIR / "scan_results"
+
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-SCAN_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
 
 header(
     "Dashboard",
     "Lihat kembali PDF yang sudah diproses dan hasil pembacaan yang tersimpan",
 )
 
-
-def archive_name(file_name):
-    stem = Path(file_name).stem
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
-    return (safe or "hasil_scan") + ".json"
-
-
-def load_saved_result(file_name):
-    path = SCAN_RESULTS_DIR / archive_name(file_name)
-
-    if not path.exists():
-        return None
-
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        hasil = data.get("hasil", {})
-
-        result = {}
-        for key, value in hasil.items():
-            if isinstance(value, list):
-                result[key] = pd.DataFrame(value)
-            else:
-                result[key] = value
-
-        return {
-            "nama_file_pdf": data.get("nama_file_pdf", file_name),
-            "waktu_scan": data.get("waktu_scan", ""),
-            "dpi": data.get("dpi", ""),
-            "hasil": result,
-        }
-    except Exception:
-        return None
 
 
 def list_pdf_files():
@@ -86,7 +56,7 @@ def list_pdf_files():
                 "nama_file_asal": path.name,
                 "waktu_file": pd.Timestamp.fromtimestamp(path.stat().st_mtime),
                 "tersimpan": True,
-                "hasil_tersimpan": (SCAN_RESULTS_DIR / archive_name(path.name)).exists(),
+                "hasil_tersimpan": (SCAN_RESULTS_DIR / archive_name(name)).exists(),
             }
         )
 
@@ -221,45 +191,30 @@ if not file_aktif:
 
 saved = load_saved_result(file_aktif)
 
-df_all = get_full_dataframe()
-
 if saved is not None:
     result = saved["hasil"]
 
-    summary = result.get("summary", pd.DataFrame())
-    ranges = result.get("ranges", pd.DataFrame())
-    parties = result.get("parties", pd.DataFrame())
-    validation = result.get("validation", pd.DataFrame())
-    tps = result.get("tps", pd.DataFrame())
-
-    st.success(
-        f"Hasil pembacaan tersimpan untuk: {file_aktif}"
-    )
+    st.success(f"Hasil pembacaan tersimpan untuk: {file_aktif}")
 
     meta1, meta2 = st.columns(2)
-
     with meta1:
         st.write(f"**Waktu pembacaan:** {saved.get('waktu_scan', '-')}")
     with meta2:
         st.write(f"**DPI:** {saved.get('dpi', '-')}")
 
 else:
-    # Fallback untuk data lama yang belum mempunyai arsip JSON.
-    # Data yang masih ada di database tetap bisa dilihat.
+    df_all = get_full_dataframe()
+
     if df_all.empty or "nama_file_asal" not in df_all.columns:
-        st.warning(
-            f"Belum ada hasil pembacaan tersimpan untuk '{file_aktif}'."
-        )
+        st.warning(f"Belum ada hasil pembacaan tersimpan untuk '{file_aktif}'.")
         st.stop()
 
-    df_file_fallback = df_all[
+    df_fallback = df_all[
         df_all["nama_file_asal"].astype(str) == str(file_aktif)
     ].copy()
 
-    if df_file_fallback.empty:
-        st.warning(
-            f"Belum ada hasil pembacaan untuk '{file_aktif}'."
-        )
+    if df_fallback.empty:
+        st.warning(f"Belum ada hasil pembacaan untuk '{file_aktif}'.")
         st.stop()
 
     st.warning(
@@ -267,12 +222,47 @@ else:
         "belum tersedia, tetapi data database masih dapat ditampilkan."
     )
 
-    summary = pd.DataFrame()
-    ranges = pd.DataFrame()
-    parties = pd.DataFrame()
-    validation = pd.DataFrame()
-    tps = df_file_fallback
+    result = {"tps": df_fallback}
 
+
+pdf_path = UPLOAD_DIR / file_aktif
+
+if pdf_path.exists():
+    with st.expander("Buka PDF asli"):
+        encoded = base64.b64encode(pdf_path.read_bytes()).decode("utf-8")
+        st.markdown(
+            f'<iframe src="data:application/pdf;base64,{encoded}" '
+            f'width="100%" height="700" type="application/pdf"></iframe>',
+            unsafe_allow_html=True,
+        )
+
+
+st.divider()
+st.header("Hasil Pembacaan Otomatis")
+st.caption(f"File: {file_aktif}")
+
+def build_excel_bytes(hasil):
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for name, df in hasil.items():
+            if name == "raw" or not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            df.to_excel(writer, sheet_name=str(name)[:31], index=False)
+    return buffer.getvalue()
+
+
+excel_bytes = build_excel_bytes(result)
+
+if excel_bytes:
+    st.download_button(
+        "Unduh hasil file ini (Excel)",
+        data=excel_bytes,
+        file_name=f"{Path(file_aktif).stem[:80]}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_excel_dashboard",
+    )
+    
+render_results(result)
 
 # ============================================================
 # PDF ASLI
@@ -307,297 +297,3 @@ st.header("Hasil Pembacaan Otomatis")
 st.caption(f"File: {file_aktif}")
 
 
-# ============================================================
-# SUMMARY
-# ============================================================
-
-if not summary.empty:
-    st.subheader("1. Ringkasan per File")
-
-    c1, c2, c3 = st.columns(3)
-
-    if "jumlah_halaman" in summary.columns:
-        total_halaman = int(
-            pd.to_numeric(
-                summary["jumlah_halaman"],
-                errors="coerce",
-            ).fillna(0).sum()
-        )
-    else:
-        total_halaman = 0
-
-    if "jumlah_kelurahan" in summary.columns:
-        total_kelurahan = int(
-            pd.to_numeric(
-                summary["jumlah_kelurahan"],
-                errors="coerce",
-            ).fillna(0).sum()
-        )
-    else:
-        total_kelurahan = (
-            int(ranges["kelurahan"].nunique())
-            if "kelurahan" in ranges.columns
-            else 0
-        )
-
-    if "jumlah_tps" in summary.columns:
-        total_tps = int(
-            pd.to_numeric(
-                summary["jumlah_tps"],
-                errors="coerce",
-            ).fillna(0).sum()
-        )
-    else:
-        total_tps = (
-            int(tps["tps"].nunique())
-            if "tps" in tps.columns
-            else 0
-        )
-
-    c1.metric("Total Halaman", f"{total_halaman:,}")
-    c2.metric("Kelurahan/Desa", f"{total_kelurahan:,}")
-    c3.metric("TPS", f"{total_tps:,}")
-
-    st.dataframe(
-        summary,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-# ============================================================
-# RANGE KELURAHAN
-# ============================================================
-
-if not ranges.empty:
-    st.subheader("2. Rentang Halaman per Kelurahan/Desa")
-
-    st.dataframe(
-        ranges,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-# ============================================================
-# SUARA PARTAI
-# ============================================================
-
-if not parties.empty:
-    st.subheader("3. Suara Partai dan Rekap Kelurahan")
-
-    parties_display = parties.copy()
-
-    # Tambahkan rekap suara kelurahan/desa ke setiap baris partai.
-    # Sumbernya adalah tabel ranges pada Point 2, sehingga nilai
-    # suara sah, tidak sah, dan total suara konsisten dengan rekap desa.
-    village_vote_columns = [
-        "kelurahan",
-        "suara_sah",
-        "suara_tidak_sah",
-        "total_suara",
-    ]
-
-    if (
-        "kelurahan" in parties_display.columns
-        and all(column in ranges.columns for column in village_vote_columns)
-    ):
-        village_votes = ranges[village_vote_columns].copy()
-        village_votes = village_votes.drop_duplicates(subset=["kelurahan"])
-
-        # Hapus kolom lama jika ternyata sudah ada di data parties,
-        # lalu ambil nilai resmi dari rekap kelurahan pada Point 2.
-        for column in [
-            "suara_sah",
-            "suara_tidak_sah",
-            "total_suara",
-        ]:
-            if column in parties_display.columns:
-                parties_display = parties_display.drop(columns=[column])
-
-        parties_display = parties_display.merge(
-            village_votes,
-            on="kelurahan",
-            how="left",
-        )
-
-    # Susun kolom agar informasi suara kelurahan langsung terlihat
-    # setelah suara akhir partai.
-    preferred_columns = [
-        "kelurahan",
-        "nama_partai",
-        "no_partai",
-        "suara_akhir_partai",
-        "suara_sah",
-        "suara_tidak_sah",
-        "total_suara",
-        "halaman",
-        "provinsi",
-        "dapil",
-        "kab_kota",
-        "kecamatan",
-        "status_validasi",
-    ]
-
-    ordered_columns = [
-        column
-        for column in preferred_columns
-        if column in parties_display.columns
-    ]
-
-    remaining_columns = [
-        column
-        for column in parties_display.columns
-        if column not in ordered_columns
-    ]
-
-    parties_display = parties_display[
-        ordered_columns + remaining_columns
-    ]
-
-    if (
-        "halaman" in parties_display.columns
-        and "status_validasi" in parties_display.columns
-    ):
-        perlu_dicek = (
-            parties_display["status_validasi"]
-            .astype(str)
-            .str.strip()
-            .ne("OK")
-        )
-
-        parties_display.loc[
-            perlu_dicek,
-            "halaman",
-        ] = parties_display.loc[
-            perlu_dicek,
-            "halaman",
-        ].apply(
-            lambda value: (
-                f"^ {value}"
-                if pd.notna(value)
-                and not str(value).strip().startswith("^")
-                else value
-            )
-        )
-
-    st.dataframe(
-        parties_display,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    if "status_validasi" in parties_display.columns:
-        jumlah_perlu_dicek = int(
-            parties_display["status_validasi"]
-            .astype(str)
-            .str.strip()
-            .ne("OK")
-            .sum()
-        )
-
-        if jumlah_perlu_dicek > 0:
-            st.warning(
-                f"{jumlah_perlu_dicek:,} data mempunyai halaman "
-                "yang perlu dilihat ulang."
-            )
-            st.caption(
-                "^ = halaman dengan suara akhir partai yang perlu dilihat ulang."
-            )
-
-
-# ============================================================
-# VALIDASI
-# ============================================================
-
-if not validation.empty:
-    st.subheader("4. Validasi Pembacaan")
-
-    if "status" in validation.columns:
-        perlu = validation[
-            validation["status"]
-            .astype(str)
-            .str.contains("PERLU DICEK", na=False)
-        ]
-    else:
-        perlu = pd.DataFrame()
-
-    if not perlu.empty:
-        st.warning(
-            f"{len(perlu):,} data perlu diperiksa."
-        )
-
-        st.dataframe(
-            perlu,
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.success("Semua data lolos validasi dasar.")
-
-# ============================================================
-# DETAIL TPS
-# ============================================================
-
-if not tps.empty:
-    st.subheader("5. Data per TPS")
-
-    if saved is not None:
-        tps_display = tps.copy()
-
-        st.dataframe(
-            tps_display,
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        detail_columns = [
-            "provinsi",
-            "dapil",
-            "kab_kota",
-            "kecamatan",
-            "kelurahan",
-            "tps",
-            "no_partai",
-            "partai",
-            "jumlah_suara",
-        ]
-
-        available_columns = [
-            col for col in detail_columns if col in tps.columns
-        ]
-
-        detail_df = tps[available_columns].copy()
-
-        detail_df = detail_df.rename(
-            columns={
-                "provinsi": "Provinsi",
-                "dapil": "Dapil",
-                "kab_kota": "Kabupaten/Kota",
-                "kecamatan": "Kecamatan",
-                "kelurahan": "Kelurahan/Desa",
-                "tps": "TPS",
-                "no_partai": "No. Partai",
-                "partai": "Partai",
-                "jumlah_suara": "Jumlah Suara",
-            }
-        )
-
-        sort_columns = [
-            col
-            for col in [
-                "Kelurahan/Desa",
-                "TPS",
-                "No. Partai",
-            ]
-            if col in detail_df.columns
-        ]
-
-        if sort_columns:
-            detail_df = detail_df.sort_values(sort_columns)
-
-        st.dataframe(
-            detail_df,
-            use_container_width=True,
-            hide_index=True,
-        )

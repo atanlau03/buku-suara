@@ -47,7 +47,19 @@ if str(BASE_DIR) not in sys.path:
         str(BASE_DIR),
     )
 
+from ui_theme import apply_theme, header
 
+st.set_page_config(
+    page_title="Buku Suara - Pemindai Data",
+    layout="wide",
+)
+
+apply_theme()
+
+header(
+    "Pemindai Data Hasil Suara",
+    "PDF → OCR Lokal → Desa → TPS → Partai → Validasi → Database",
+)
 # ============================================================
 # DATABASE
 # ============================================================
@@ -56,6 +68,8 @@ from database import (
     import_dataframe,
     init_db,
 )
+from scan_archive import save_scan_result
+from results_view import render_results
 
 
 # ============================================================
@@ -93,33 +107,18 @@ UPLOAD_DIR.mkdir(
     exist_ok=True,
 )
 
-SCAN_RESULTS_DIR = BASE_DIR / "scan_results"
-SCAN_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
 # PAGE CONFIG
 # ============================================================
 
+from ui_theme import apply_theme, header
+
 st.set_page_config(
-    page_title="Buku Suara - Pemindai Data",
+    page_title="Buku Suara - Ambil Data dari Google Drive",
     layout="wide",
 )
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-st.title(
-    "Pemindai Data Hasil Suara"
-)
-
-st.caption(
-    "PDF → OCR Lokal → Struktur Dokumen → "
-    "Desa → TPS → Partai → Validasi → Database"
-)
-
 
 # ============================================================
 # STATE
@@ -166,38 +165,6 @@ if "result_ready_notified" not in st.session_state:
 # ============================================================
 # PENYIMPANAN HASIL PEMBACAAN
 # ============================================================
-
-def _archive_name(file_name):
-    stem = Path(file_name).stem
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
-    return (safe or "hasil_scan") + ".json"
-
-
-def save_scan_result(file_name, result, dpi_val):
-    """Simpan hasil pembacaan agar bisa dibuka kembali dari Dashboard."""
-    archive = {
-        "nama_file_pdf": file_name,
-        "waktu_scan": pd.Timestamp.now().isoformat(),
-        "dpi": int(dpi_val),
-        "hasil": {},
-    }
-
-    for key, value in result.items():
-        if isinstance(value, pd.DataFrame):
-            archive["hasil"][key] = json.loads(
-                value.to_json(orient="records", date_format="iso")
-            )
-        else:
-            archive["hasil"][key] = value
-
-    output_path = SCAN_RESULTS_DIR / _archive_name(file_name)
-    temp_path = output_path.with_suffix(".tmp")
-    temp_path.write_text(
-        json.dumps(archive, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temp_path.replace(output_path)
-
 
 # ============================================================
 # BACKGROUND WORKER
@@ -698,40 +665,12 @@ render_progress_section()
 # HASIL
 # ============================================================
 
-result = st.session_state.get(
-    "scan_result"
-)
-
+result = st.session_state.get("scan_result")
 
 if result:
-
-    summary = result.get(
-        "summary",
-        pd.DataFrame(),
-    )
-
-    ranges = result.get(
-        "ranges",
-        pd.DataFrame(),
-    )
-
-    parties = result.get(
-        "parties",
-        pd.DataFrame(),
-    )
-
-    validation = result.get(
-        "validation",
-        pd.DataFrame(),
-    )
-
-
     st.divider()
-
-    st.header(
-        "Hasil Pembacaan Otomatis"
-    )
-
+    st.header("Hasil Pembacaan Otomatis")
+    render_results(result)
 
     # ========================================================
     # SUMMARY
