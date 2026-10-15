@@ -147,7 +147,7 @@ def _rotate_key():
 # untuk tugas ekstraksi terstruktur seperti ini. Cek daftar model
 # terkini di https://ai.google.dev/gemini-api/docs/models kalau nama
 # ini sudah tidak berlaku lagi.
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
 
 
 # ================================================================
@@ -260,7 +260,7 @@ def _call_gemini(image_bytes, prompt, model=None, max_output_tokens=1000):
 
     last_error = None
 
-    for attempt in range(max(len(_API_KEYS), 1)):
+    for attempt in range(max(len(_API_KEYS), 1) + 3):
 
         client = _get_client()
 
@@ -279,15 +279,19 @@ def _call_gemini(image_bytes, prompt, model=None, max_output_tokens=1000):
         except Exception as exc:
 
             last_error = exc
+            pesan = str(exc).upper()
+
+            sementara = any(k in pesan for k in ("503", "UNAVAILABLE", "OVERLOADED", "HIGH DEMAND", "500", "504"))
 
             if _is_quota_error(exc) and len(_API_KEYS) > 1:
-                # Key ini kena limit -- pindah ke key berikutnya dan coba lagi.
                 _rotate_key()
                 time.sleep(0.5)
                 continue
 
-            # Bukan error kuota (atau cuma ada 1 key) -> tidak ada
-            # gunanya diulang, langsung lempar ke pemanggil.
+            if sementara and attempt < max(len(_API_KEYS), 1) + 2:
+                time.sleep(5 * (attempt + 1))
+                continue
+
             raise
 
     # Semua key sudah dicoba dan semuanya kena limit.
@@ -394,13 +398,15 @@ ATURAN PENTING:
 - Kalau tabel partai itu terpecah (ada kolom "JUMLAH PINDAHAN"), AMBIL ANGKA DARI KOLOM "JUMLAH AKHIR" (paling kanan), BUKAN "JUMLAH PINDAHAN".
 - KALAU ANGKA TIDAK JELAS TERBACA, JANGAN MASUKKAN partai itu ke hasil sama sekali (lebih baik kosong daripada menebak).
 - Cocokkan nomor & nama partai dengan daftar resmi di atas.
+- Field "partai" HARUS berupa NOMOR (angka 1-18), bukan nama partai.
+- Ambil angka dari baris berlabel "JUMLAH SUARA SAH PARTAI POLITIK DAN CALON", BUKAN dari baris nama caleg.
 
 Balas dengan JSON array, format:
 [{{"partai": <nomor>, "suara_akhir_partai": <angka>}}, ...]
 
 Kalau tidak ada partai yang bisa dibaca dengan yakin di halaman ini, balas: []"""
 
-        text = _call_gemini(image_bytes, prompt, model=model, max_output_tokens=1500)
+        text = _call_gemini(image_bytes, prompt, model=model, max_output_tokens=6000)
 
         data = _extract_json(text)
 
@@ -413,8 +419,16 @@ Kalau tidak ada partai yang bisa dibaca dengan yakin di halaman ini, balas: []""
             if not isinstance(item, dict):
                 continue
 
-            party_no = _safe_int(item.get("partai"))
-            vote = _safe_int(item.get("suara_akhir_partai"))
+            raw = item.get("partai")
+            party_no = _safe_int(raw)
+
+            if party_no is None and isinstance(raw, str):
+                for num, nama in party_names.items():
+                    if nama.lower() == raw.strip().lower():
+                        party_no = num
+                        break
+            raw_vote = item.get("suara_akhir_partai")
+            vote = _safe_int(raw_vote)
 
             if party_no is None or vote is None:
                 continue
@@ -432,5 +446,6 @@ Kalau tidak ada partai yang bisa dibaca dengan yakin di halaman ini, balas: []""
 
         return results
 
-    except Exception:
+    except Exception as exc:
+        print(f"[AI vision] gagal: {type(exc).__name__}: {str(exc)[:200]}", flush=True)
         return []

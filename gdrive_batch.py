@@ -132,6 +132,8 @@ CHECKPOINT_COLUMNS = [
     "file_hasil", "diproses_pada", "durasi_detik",
 ]
 
+MAX_HALAMAN_OCR = 300 
+
 RESULT_SHEET_ORDER = ["summary", "ranges", "tps", "parties", "validation", "db"]
 
 
@@ -532,15 +534,12 @@ def check_text_layer(pdf_bytes, min_chars=100, min_text_ratio=0.5):
         }
 
         if text_pages / total < min_text_ratio:
-            if scan_pages / total >= 0.5:
-                jenis = (
-                    f"{scan_pages} halaman berupa gambar penuh -> hasil scan"
-                )
+            if text_pages == 0:
+                jenis = "tidak ada text layer sama sekali (kemungkinan hasil scan)"
+            elif scan_pages / total >= 0.5:
+                jenis = f"{scan_pages} halaman berupa gambar penuh -> hasil scan"
             else:
-                jenis = (
-                    "bukan gambar penuh juga (teks mungkin berupa garis/"
-                    "vektor atau font tidak terbaca)"
-                )
+                jenis = "sebagian halaman tanpa teks"
 
             return False, (
                 f"Text layer minim: hanya {text_pages} dari {total} halaman "
@@ -761,8 +760,23 @@ def process_job(source, job, out_dir, dpi=300, log=_log, on_result=None):
     row["halaman_bertext"] = info.get("halaman_bertext")
     row["halaman_scan"] = info.get("halaman_scan")
 
+    dipaksa_ocr = False
+
     if not ok:
-        return finish(STATUS_SKIP, reason)
+        # PDF rusak / terenkripsi / kosong: memang tidak bisa dibaca.
+        if not info.get("halaman"):
+            return finish(STATUS_SKIP, reason)
+
+        # Terlalu banyak halaman: OCR terlalu lama, lewati.
+        if info["halaman"] > MAX_HALAMAN_OCR:
+            return finish(
+                STATUS_SKIP,
+                f"{reason}; {info['halaman']} halaman, melebihi batas OCR ({MAX_HALAMAN_OCR})",
+            )
+
+        dipaksa_ocr = True
+        log(f"      ! {reason} -> dicoba lewat OCR/AI")
+
 
     try:
         hasil = engine.process_pdf_local_engine(
@@ -772,8 +786,8 @@ def process_job(source, job, out_dir, dpi=300, log=_log, on_result=None):
             dpi_val=dpi,
         )
     except Exception as e:
-        return finish(STATUS_ERROR, f"Engine error: {type(e).__name__}: {e}"[:300])
-
+        awal = "Tanpa text layer, OCR dicoba tetapi error: " if dipaksa_ocr else "Engine error: "
+        return finish(STATUS_ERROR, f"{awal}{type(e).__name__}: {e}"[:300])
     # Lengkapi wilayah yang gagal terbaca dari teks PDF, pakai nama folder Drive.
     kosong = {"", "-", "none", "nan"}
 
@@ -797,8 +811,26 @@ def process_job(source, job, out_dir, dpi=300, log=_log, on_result=None):
 
     quality = assess_result(hasil)
     row.update(quality)
+    skor = None
+    if dipaksa_ocr and quality["jumlah_kelurahan"]:
+        skor = round(
+            (quality["jumlah_kelurahan"] - quality["kelurahan_perlu_cek"])
+            / quality["jumlah_kelurahan"] * 100
+        )
+
+    if dipaksa_ocr:
+        for sheet in ("parties", "gabungan_dashboard"):
+            df = hasil.get(sheet)
+            if isinstance(df, pd.DataFrame) and "status_validasi" in df.columns:
+                df["status_validasi"] = "PERLU DICEK"
 
     if quality["jumlah_kelurahan"] == 0 or quality["jumlah_tps"] == 0:
+        if dipaksa_ocr:
+            return finish(
+                STATUS_SKIP,
+                "Tanpa text layer; OCR sudah dicoba tetapi tidak ada desa/TPS "
+                "yang terbaca (hasil OCR buruk atau format scan tidak dikenali)",
+            )
         return finish(STATUS_SKIP, "Engine tidak menemukan kelurahan/TPS yang dapat dibaca")
 
     stem = safe_name(os.path.splitext(job.file.name)[0])
@@ -829,12 +861,19 @@ def process_job(source, job, out_dir, dpi=300, log=_log, on_result=None):
                 f"Gagal menyimpan ke database/arsip: {type(e).__name__}: {e}"[:300],
             )
 
-    row["file_hasil"] = result_path
+        row["file_hasil"] = result_path
     note = ""
-    if quality["kelurahan_perlu_cek"]:
+    if dipaksa_ocr:
+        if skor is not None and skor < 40:
+            return finish(
+                STATUS_SKIP,
+                f"Tanpa text layer; OCR kualitas buruk ({skor}%), tidak disimpan",
+            )
+        tingkat = "baik" if skor is not None and skor >= 80 else "sedang"
+        note = f"Tanpa text layer; dibaca lewat OCR, kualitas {tingkat} ({skor}%), perlu dicek"
+    elif quality["kelurahan_perlu_cek"]:
         note = f"{quality['kelurahan_perlu_cek']} kelurahan perlu dicek"
     return finish(STATUS_DONE, note)
-
 
 # ============================================================
 # GABUNG HASIL PER DAPIL
