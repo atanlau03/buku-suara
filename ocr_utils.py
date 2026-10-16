@@ -7,7 +7,8 @@ import pandas as pd
 import pymupdf
 from PIL import Image
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+_KEY_LIST = [k.strip() for k in os.getenv("GEMINI_API_KEYS", "").split(",") if k.strip()]
+GEMINI_API_KEYS = _KEY_LIST[0] if _KEY_LIST else ""
 # CATATAN KEAMANAN: sebelumnya di sini ada API key Gemini yang di-hardcode
 # langsung di source code. Itu bocor begitu file/zip ini dibagikan ke siapa
 # pun (termasuk ke saya barusan). API key tsb HARUS dianggap sudah bocor -->
@@ -128,7 +129,7 @@ def process_single_page_ocr(
     tps="-",
     api_key=None,
 ) -> tuple[pd.DataFrame, dict, str]:
-    active_key = api_key if api_key else GEMINI_API_KEY
+    active_key = api_key if api_key else GEMINI_API_KEYS
     if not active_key:
         return (
             pd.DataFrame(),

@@ -126,7 +126,7 @@ def is_valid_kelurahan(name):
 # extract_closing_votes_positional() (OCR koordinat) sama-sama gagal,
 # atau saat suara akhir partai gagal dibaca lewat parser teks.
 #
-# Kalau file ai_vision_fallback.py tidak ada, atau GEMINI_API_KEY
+# Kalau file ai_vision_fallback.py tidak ada, atau GEMINI_API_KEYS
 # belum diset, engine tetap jalan normal seperti biasa TANPA AI -- ini
 # hanya lapisan tambahan opsional, bukan pengganti Tesseract.
 # ------------------------------------------------------------------

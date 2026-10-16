@@ -1,65 +1,26 @@
 """
 gdrive_batch.py -- Pemrosesan batch PER DAPIL dari Google Drive.
 
-Struktur folder yang diasumsikan (sesuai Drive Anda):
+Struktur folder:
+    ROOT/<Dapil>/<Kabupaten>/<Kecamatan>/<file PDF>.pdf
 
-    ROOT/
-      <Nama Dapil>/
-        <Nama Kabupaten/Kota>/
-          <Nama Kecamatan>/
-            <file PDF data pemilu kecamatan>.pdf
+Alur per file:
+  1. Ada text layer layak  -> baca langsung (cepat).
+  2. Tanpa text layer      -> status ANTRE_OCR, dikerjakan SETELAH semua file
+                              cepat selesai (tidak menahan file lain).
+  3. Giliran OCR           -> Tesseract; skor kualitas dihitung.
+                              Skor buruk -> (opsional) AI, atau DILEWATI.
 
-Alur:
- 1. Terhubung ke Google Drive (atau folder lokal, untuk Drive Desktop / uji coba).
- 2. Pilih SATU dapil -> telusuri semua kabupaten -> kecamatan -> PDF.
- 3. Setiap PDF diperiksa dulu: apakah text layer-nya layak dibaca engine?
-      - layak     -> diproses engine (process_pdf_local_engine)
-      - tidak     -> DILEWATI (dicatat beserta alasannya, tidak di-OCR)
- 4. Setiap kecamatan langsung dicatat ke file CHECKPOINT (Excel). Kalau proses
-    berhenti di tengah jalan, jalankan lagi: yang sudah SELESAI tidak diulang.
- 5. Hasil tiap kecamatan disimpan, lalu digabung menjadi satu Excel per dapil.
+STATUS checkpoint:
+    SELESAI, DILEWATI, ERROR, TIDAK_ADA_PDF, ULANG, ANTRE_OCR
 
-STATUS pada checkpoint:
-    SELESAI        sudah terbaca. Tidak diproses ulang.
-    DILEWATI       text layer buruk / format tidak didukung. Tidak diproses ulang
-                   (kecuali --retry-skipped atau status diubah manual jadi ULANG).
-    ERROR          gagal unduh / engine error. Otomatis dicoba lagi di run berikutnya.
-    TIDAK_ADA_PDF  folder kecamatan tidak berisi PDF.
-    ULANG          isi manual di Excel untuk memaksa satu baris diproses ulang.
-
-------------------------------------------------------------------
-SETUP GOOGLE DRIVE (sekali saja)
-------------------------------------------------------------------
-    pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
-
- Cara A -- OAuth (akun Google Anda sendiri, paling mudah):
-    1. console.cloud.google.com -> buat project -> aktifkan "Google Drive API".
-    2. APIs & Services -> Credentials -> Create Credentials -> OAuth client ID
-       -> tipe "Desktop app" -> unduh JSON, simpan sebagai credentials.json
-       di folder yang sama dengan file ini.
-    3. Run pertama membuka browser untuk login; token disimpan di token.json.
- Cara B -- Service account: bagikan (share) folder ROOT ke email service account,
-    lalu jalankan dengan --service-account service_account.json.
-
-Hak akses yang diminta hanya BACA (drive.readonly).
-
-------------------------------------------------------------------
-CARA PAKAI
-------------------------------------------------------------------
-    python gdrive_batch.py --root "<URL atau ID folder ROOT>" --list-dapil
-    python gdrive_batch.py --root "<URL atau ID folder ROOT>" --dapil "JAWA BARAT VIII"
-
-    # Folder lokal (mis. hasil unduhan / Google Drive for Desktop):
+Pemakaian:
+    python gdrive_batch.py --root "<URL/ID>" --list-dapil
+    python gdrive_batch.py --root "<URL/ID>" --dapil "JAWA BARAT VIII"
     python gdrive_batch.py --local "D:\\Pemilu" --dapil "JAWA BARAT VIII"
-
-    # Kenapa satu file dilewati? (unduh filenya dulu, lalu:)
     python gdrive_batch.py --diagnose "C:\\path\\file.pdf"
 
-Dari Python / Streamlit:
-    from gdrive_batch import DriveSource, run_dapil
-    src = DriveSource()   # atau LocalSource()
-    hasil = run_dapil(src, root_id, "JAWA BARAT VIII",
-                      progress_callback=lambda v, m: ...)
+AI untuk file scan (memakai kuota) aktif hanya bila .env berisi GDRIVE_AI_SCAN=1.
 """
 
 import argparse
@@ -80,14 +41,11 @@ from typing import Optional
 import fitz
 import pandas as pd
 
-# Nama modul engine (tanpa .py), dicoba berurutan. Tambahkan bila nama Anda lain.
 ENGINE_MODULE_CANDIDATES = ("local_ocr_engine", "ocr_engine_buku_suara")
 
 
 def _load_engine():
     for name in ENGINE_MODULE_CANDIDATES:
-        # find_spec dulu supaya error DI DALAM engine (mis. pytesseract belum
-        # terpasang) tidak tertelan dan tersamar sebagai "modul tidak ada".
         if importlib.util.find_spec(name) is not None:
             return importlib.import_module(name)
     raise ImportError(
@@ -98,14 +56,12 @@ def _load_engine():
 
 engine = _load_engine()
 
-# Satu proses batch pada satu waktu (melindungi checkpoint dari tabrakan,
-# mis. tombol Mulai ditekan dari dua tab browser).
+# Satu proses batch pada satu waktu (melindungi checkpoint dari tabrakan).
 _RUN_LOCK = threading.Lock()
 
 
 def is_batch_running():
-    """True bila ada proses batch yang sedang berjalan di server ini
-    (termasuk yang dimulai dari sesi/tab browser lain)."""
+    """True bila ada proses batch yang sedang berjalan di server ini."""
     return _RUN_LOCK.locked()
 
 
@@ -122,6 +78,7 @@ STATUS_SKIP = "DILEWATI"
 STATUS_ERROR = "ERROR"
 STATUS_EMPTY = "TIDAK_ADA_PDF"
 STATUS_RETRY = "ULANG"
+STATUS_QUEUE = "ANTRE_OCR"
 
 CHECKPOINT_COLUMNS = [
     "dapil", "kabupaten", "kecamatan", "nama_file", "file_id",
@@ -132,9 +89,19 @@ CHECKPOINT_COLUMNS = [
     "file_hasil", "diproses_pada", "durasi_detik",
 ]
 
-MAX_HALAMAN_OCR = 300 
+RESULT_SHEET_ORDER = [
+    "summary", "ranges", "tps", "parties", "validation", "db",
+    "gabungan_dashboard",
+]
 
-RESULT_SHEET_ORDER = ["summary", "ranges", "tps", "parties", "validation", "db"]
+# PDF tanpa text layer dengan halaman lebih banyak dari ini langsung DILEWATI.
+MAX_HALAMAN_OCR = 500
+
+# Skor OCR (persen desa yang lolos validasi) di bawah ini dianggap buruk.
+SKOR_MINIMAL = 40
+
+# AI untuk file scan: mati bawaan (memakai kuota Gemini).
+USE_AI_SCAN = os.getenv("GDRIVE_AI_SCAN", "0") == "1"
 
 
 def _log(msg):
@@ -165,7 +132,7 @@ def is_pdf(node):
 
 
 def _retry(fn, tries=5, base=2.0):
-    """Ulangi panggilan API bila error sementara (rate limit / 5xx / koneksi)."""
+    """Ulangi panggilan API bila error sementara."""
     for attempt in range(tries):
         try:
             return fn()
@@ -188,33 +155,13 @@ def parse_drive_id(value):
         re.search(r"/folders/([A-Za-z0-9_-]+)", value)
         or re.search(r"[?&]id=([A-Za-z0-9_-]+)", value)
     )
-    result = m.group(1) if m else value
-
-    if not result:
-        raise ValueError(
-            "Link/ID folder Google Drive masih kosong atau tidak valid."
-        )
-
-    return result
+    return m.group(1) if m else value
 
 
 class LocalSource:
     """Membaca struktur folder yang sama dari disk lokal."""
 
     def list_children(self, folder_id):
-        folder_id = (folder_id or "").strip()
-
-        if not folder_id:
-            raise FileNotFoundError(
-                "Folder lokal induk masih kosong. Isi kolom 'Folder lokal induk' "
-                "terlebih dahulu (path lengkap ke folder yang berisi folder-folder dapil)."
-            )
-
-        if not os.path.isdir(folder_id):
-            raise FileNotFoundError(
-                f"Folder '{folder_id}' tidak ditemukan atau bukan folder."
-            )
-
         nodes = []
         for name in sorted(os.listdir(folder_id), key=str.lower):
             path = os.path.join(folder_id, name)
@@ -234,13 +181,6 @@ class LocalSource:
 
 class DriveSource:
     """Google Drive API v3 (baca saja)."""
-
-    # Mengunci proses LOGIN INTERAKTIF (bukan pemakaian API setelahnya) supaya
-    # tidak terbuka dua jendela/link login sekaligus bila dua bagian aplikasi
-    # sama-sama butuh kredensial pada saat bersamaan sebelum token.json ada.
-    # Panggilan kedua akan menunggu, lalu memakai token yang baru saja
-    # dibuat oleh panggilan pertama -- tanpa perlu login ulang.
-    _AUTH_LOCK = threading.Lock()
 
     def __init__(
         self,
@@ -268,43 +208,34 @@ class DriveSource:
             from google.oauth2.credentials import Credentials
             from google_auth_oauthlib.flow import InstalledAppFlow
 
-            with DriveSource._AUTH_LOCK:
+            creds = None
 
-                creds = None
+            if os.path.exists(token_file):
+                creds = Credentials.from_authorized_user_file(
+                    token_file, DRIVE_SCOPES
+                )
 
-                if os.path.exists(token_file):
-                    creds = Credentials.from_authorized_user_file(
-                        token_file, DRIVE_SCOPES
-                    )
-
-                if not creds or not creds.valid:
-                    if creds and creds.expired and creds.refresh_token:
-                        creds.refresh(Request())
-                    else:
-                        if not os.path.exists(credentials_file):
-                            raise FileNotFoundError(
-                                f"{credentials_file} tidak ditemukan. Lihat bagian "
-                                "SETUP GOOGLE DRIVE di atas file gdrive_batch.py."
-                            )
-                        flow = InstalledAppFlow.from_client_secrets_file(
-                            credentials_file, DRIVE_SCOPES
+            if not creds or not creds.valid:
+                if creds and creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                else:
+                    if not os.path.exists(credentials_file):
+                        raise FileNotFoundError(
+                            f"{credentials_file} tidak ditemukan. Lihat bagian "
+                            "SETUP GOOGLE DRIVE (pip install google-api-python-client "
+                            "google-auth-oauthlib google-auth-httplib2)."
                         )
-                        creds = flow.run_local_server(port=0)
+                    flow = InstalledAppFlow.from_client_secrets_file(
+                        credentials_file, DRIVE_SCOPES
+                    )
+                    creds = flow.run_local_server(port=0)
 
-                    with open(token_file, "w") as f:
-                        f.write(creds.to_json())
+                with open(token_file, "w") as f:
+                    f.write(creds.to_json())
 
         return build("drive", "v3", credentials=creds, cache_discovery=False)
 
     def list_children(self, folder_id):
-        folder_id = (folder_id or "").strip()
-
-        if not folder_id:
-            raise ValueError(
-                "Folder induk Google Drive masih kosong. Isi kolom 'Folder induk "
-                "Google Drive (URL atau ID)' terlebih dahulu."
-            )
-
         nodes = []
         page_token = None
 
@@ -467,14 +398,7 @@ def discover_jobs(source, dapil_node, log=_log):
 
 def check_text_layer(pdf_bytes, min_chars=100, min_text_ratio=0.5):
     """
-    Cek cepat (tanpa OCR) apakah PDF layak dibaca engine.
-
-    Syarat layak:
-      1. PDF bisa dibuka, tidak terenkripsi, punya halaman.
-      2. Minimal `min_text_ratio` halaman punya text layer (>= min_chars huruf).
-      3. Minimal satu halaman penutup desa terdeteksi dari text layer
-         (memakai engine.is_closing_page, yaitu aturan yang sama dengan engine).
-
+    Cek cepat (tanpa OCR) apakah PDF layak dibaca lewat text layer.
     Return: (ok, alasan, info)
     """
     try:
@@ -491,7 +415,7 @@ def check_text_layer(pdf_bytes, min_chars=100, min_text_ratio=0.5):
             return False, "PDF tidak memiliki halaman", {}
 
         text_pages = 0
-        scan_pages = 0  # halaman yang hampir seluruhnya berupa gambar
+        scan_pages = 0
         total_chars = 0
         closing_pages = 0
 
@@ -508,13 +432,11 @@ def check_text_layer(pdf_bytes, min_chars=100, min_text_ratio=0.5):
             if chars >= min_chars:
                 text_pages += 1
 
-            # Logo/latar kecil TIDAK dihitung: halaman scan = ada gambar yang
-            # menutup >= 40% luas halaman.
             try:
                 if page is not None:
                     area = page.rect.width * page.rect.height
                     biggest = max(
-                        (fitz.Rect(i["bbox"]).get_area() for i in page.get_image_info()),
+                        (fitz.Rect(g["bbox"]).get_area() for g in page.get_image_info()),
                         default=0,
                     )
                     if area > 0 and biggest / area >= 0.4:
@@ -576,9 +498,8 @@ def _autofit(ws, max_width=60):
 class Checkpoint:
     """
     File Excel yang mencatat status setiap file kecamatan.
-
-    Sheet "checkpoint"   : semua baris (dipakai sistem untuk melanjutkan proses).
-    Sheet "sulit_dibaca" : hanya DILEWATI + ERROR (daftar kerja untuk Anda).
+    Sheet "checkpoint"   : semua baris.
+    Sheet "sulit_dibaca" : DILEWATI + ERROR.
     """
 
     def __init__(self, path, log=_log):
@@ -594,7 +515,6 @@ class Checkpoint:
         try:
             df = pd.read_excel(self.path, sheet_name="checkpoint", dtype=str)
         except Exception as e:
-            # Jangan menimpa diam-diam: file mungkin rusak / diedit salah.
             raise RuntimeError(
                 f"Checkpoint '{self.path}' tidak bisa dibaca ({e}). "
                 "Perbaiki atau ganti namanya agar tidak tertimpa."
@@ -611,19 +531,23 @@ class Checkpoint:
     def get(self, key):
         return self.rows.get(key)
 
+    def status_of(self, key):
+        rec = self.rows.get(key)
+        return rec.get("status") if rec else None
+
     def drop(self, key):
         self.rows.pop(key, None)
 
     def should_skip(self, key, retry_skipped=False):
-        prev = self.rows.get(key)
-        if not prev:
+        status = self.status_of(key)
+        if not status:
             return False
-        status = prev.get("status")
         if status == STATUS_DONE:
             return True
         if status == STATUS_SKIP and not retry_skipped:
             return True
-        return False  # ERROR, ULANG, TIDAK_ADA_PDF, lainnya -> dikerjakan
+        # ERROR, ULANG, ANTRE_OCR, TIDAK_ADA_PDF -> dikerjakan
+        return False
 
     def record(self, row):
         self.rows[row["file_id"]] = row
@@ -637,7 +561,11 @@ class Checkpoint:
         )
         hard = df[df["status"].isin([STATUS_SKIP, STATUS_ERROR])]
 
-        tmp = self.path[:-5] + ".tmp.xlsx" if self.path.lower().endswith(".xlsx") else self.path + ".tmp.xlsx"
+        tmp = (
+            self.path[:-5] + ".tmp.xlsx"
+            if self.path.lower().endswith(".xlsx")
+            else self.path + ".tmp.xlsx"
+        )
 
         with pd.ExcelWriter(tmp, engine="openpyxl") as writer:
             df.to_excel(writer, sheet_name="checkpoint", index=False)
@@ -650,9 +578,9 @@ class Checkpoint:
                 os.replace(tmp, self.path)
                 return
             except PermissionError:
-                time.sleep(2)  # kemungkinan file sedang dibuka di Excel
+                time.sleep(2)
 
-        alt = self.path[:-5] + f"_cadangan_{datetime.now():%H%M%S}.xlsx"
+        alt = self.path[:-5] + "_cadangan.xlsx"
         os.replace(tmp, alt)
         self.log(
             f"   ! '{self.path}' sedang terkunci (dibuka di Excel?). "
@@ -726,7 +654,38 @@ def _write_result(hasil, meta, path):
                 _tag(df, meta).to_excel(writer, sheet_name=name, index=False)
 
 
-def process_job(source, job, out_dir, dpi=300, log=_log, on_result=None):
+def _isi_wilayah(hasil, job):
+    """Lengkapi dapil/kab_kota/kecamatan yang kosong dari nama folder Drive."""
+    kosong = {"", "-", "none", "nan"}
+
+    for sheet in ("tps", "parties", "gabungan_dashboard", "db"):
+        df = hasil.get(sheet)
+
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+
+        for col, nilai in (
+            ("dapil", job.dapil),
+            ("kab_kota", job.kabupaten),
+            ("kecamatan", job.kecamatan),
+        ):
+            if col in df.columns:
+                df[col] = df[col].apply(
+                    lambda v, n=nilai: n
+                    if v is None or pd.isna(v) or str(v).strip().lower() in kosong
+                    else v
+                )
+
+
+def process_job(
+    source, job, out_dir, dpi=300, log=_log, on_result=None,
+    force_ocr=False, defer_ocr=False,
+):
+    """
+    defer_ocr=True : file tanpa text layer TIDAK di-OCR sekarang, tetapi dicatat
+                     ANTRE_OCR supaya file lain tidak menunggu.
+    force_ocr=True : giliran OCR (dari antrean).
+    """
     started = time.time()
 
     row = {c: None for c in CHECKPOINT_COLUMNS}
@@ -767,16 +726,22 @@ def process_job(source, job, out_dir, dpi=300, log=_log, on_result=None):
         if not info.get("halaman"):
             return finish(STATUS_SKIP, reason)
 
-        # Terlalu banyak halaman: OCR terlalu lama, lewati.
+        # Terlalu panjang: OCR terlalu lama.
         if info["halaman"] > MAX_HALAMAN_OCR:
             return finish(
                 STATUS_SKIP,
                 f"{reason}; {info['halaman']} halaman, melebihi batas OCR ({MAX_HALAMAN_OCR})",
             )
 
-        dipaksa_ocr = True
-        log(f"      ! {reason} -> dicoba lewat OCR/AI")
+        # Masuk antrean: dikerjakan setelah semua file bertext layer selesai.
+        if defer_ocr and not force_ocr:
+            return finish(
+                STATUS_QUEUE,
+                f"{reason}; menunggu antrean OCR (dikerjakan setelah file bertext layer)",
+            )
 
+        dipaksa_ocr = True
+        log(f"      ! {reason} -> dicoba lewat OCR")
 
     try:
         hasil = engine.process_pdf_local_engine(
@@ -788,29 +753,12 @@ def process_job(source, job, out_dir, dpi=300, log=_log, on_result=None):
     except Exception as e:
         awal = "Tanpa text layer, OCR dicoba tetapi error: " if dipaksa_ocr else "Engine error: "
         return finish(STATUS_ERROR, f"{awal}{type(e).__name__}: {e}"[:300])
-    # Lengkapi wilayah yang gagal terbaca dari teks PDF, pakai nama folder Drive.
-    kosong = {"", "-", "none", "nan"}
 
-    for sheet in ("tps", "parties", "gabungan_dashboard", "db"):
-        df = hasil.get(sheet)
-
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            continue
-
-        for col, nilai in (
-            ("dapil", job.dapil),
-            ("kab_kota", job.kabupaten),
-            ("kecamatan", job.kecamatan),
-        ):
-            if col in df.columns:
-                df[col] = df[col].apply(
-                    lambda v, n=nilai: n
-                    if v is None or pd.isna(v) or str(v).strip().lower() in kosong
-                    else v
-                )
+    _isi_wilayah(hasil, job)
 
     quality = assess_result(hasil)
     row.update(quality)
+
     skor = None
     if dipaksa_ocr and quality["jumlah_kelurahan"]:
         skor = round(
@@ -818,11 +766,32 @@ def process_job(source, job, out_dir, dpi=300, log=_log, on_result=None):
             / quality["jumlah_kelurahan"] * 100
         )
 
-    if dipaksa_ocr:
-        for sheet in ("parties", "gabungan_dashboard"):
-            df = hasil.get(sheet)
-            if isinstance(df, pd.DataFrame) and "status_validasi" in df.columns:
-                df["status_validasi"] = "PERLU DICEK"
+    # Opsional: OCR buruk -> AI vision (memakai kuota, mati bawaan).
+    dipaksa_ai = False
+
+    if (
+        dipaksa_ocr
+        and USE_AI_SCAN
+        and getattr(engine, "AI_VISION_AVAILABLE", False)
+        and (skor is None or skor < SKOR_MINIMAL)
+    ):
+        try:
+            import scan_ai_reader
+
+            log("      ! OCR buruk -> dicoba lewat AI (memakai kuota)")
+            hasil = scan_ai_reader.read_scan_pdf(
+                data, file_name=job.file.name, log=log
+            )
+            _isi_wilayah(hasil, job)
+            quality = assess_result(hasil)
+            quality["jumlah_tps"] = max(quality["jumlah_tps"], 1)
+            row.update(quality)
+            dipaksa_ai = True
+        except Exception as e:
+            return finish(
+                STATUS_SKIP,
+                f"Tanpa text layer; OCR buruk, AI gagal: {str(e)[:150]}",
+            )
 
     if quality["jumlah_kelurahan"] == 0 or quality["jumlah_tps"] == 0:
         if dipaksa_ocr:
@@ -832,6 +801,18 @@ def process_job(source, job, out_dir, dpi=300, log=_log, on_result=None):
                 "yang terbaca (hasil OCR buruk atau format scan tidak dikenali)",
             )
         return finish(STATUS_SKIP, "Engine tidak menemukan kelurahan/TPS yang dapat dibaca")
+
+    if dipaksa_ocr and not dipaksa_ai and (skor is None or skor < SKOR_MINIMAL):
+        return finish(
+            STATUS_SKIP,
+            f"Tanpa text layer; OCR kualitas buruk ({skor or 0}%), tidak disimpan",
+        )
+
+    if dipaksa_ocr:
+        for sheet in ("parties", "gabungan_dashboard"):
+            df = hasil.get(sheet)
+            if isinstance(df, pd.DataFrame) and "status_validasi" in df.columns:
+                df["status_validasi"] = "PERLU DICEK"
 
     stem = safe_name(os.path.splitext(job.file.name)[0])
     base = f"{safe_name(job.kecamatan)}__{stem}" if job.multi_file else safe_name(job.kecamatan)
@@ -851,7 +832,6 @@ def process_job(source, job, out_dir, dpi=300, log=_log, on_result=None):
     except Exception as e:
         return finish(STATUS_ERROR, f"Gagal menyimpan hasil: {type(e).__name__}: {e}"[:300])
 
-    # Hook opsional (mis. simpan ke database / arsip Dashboard).
     if on_result is not None:
         try:
             on_result(job, hasil, result_path)
@@ -861,19 +841,18 @@ def process_job(source, job, out_dir, dpi=300, log=_log, on_result=None):
                 f"Gagal menyimpan ke database/arsip: {type(e).__name__}: {e}"[:300],
             )
 
-        row["file_hasil"] = result_path
+    row["file_hasil"] = result_path
+
     note = ""
-    if dipaksa_ocr:
-        if skor is not None and skor < 40:
-            return finish(
-                STATUS_SKIP,
-                f"Tanpa text layer; OCR kualitas buruk ({skor}%), tidak disimpan",
-            )
-        tingkat = "baik" if skor is not None and skor >= 80 else "sedang"
-        note = f"Tanpa text layer; dibaca lewat OCR, kualitas {tingkat} ({skor}%), perlu dicek"
+    if dipaksa_ai:
+        note = "Tanpa text layer; OCR buruk, dibaca ulang AI, perlu dicek"
+    elif dipaksa_ocr:
+        note = f"Tanpa text layer; dibaca lewat OCR, kualitas {skor}%, perlu dicek"
     elif quality["kelurahan_perlu_cek"]:
         note = f"{quality['kelurahan_perlu_cek']} kelurahan perlu dicek"
+
     return finish(STATUS_DONE, note)
+
 
 # ============================================================
 # GABUNG HASIL PER DAPIL
@@ -928,12 +907,13 @@ def run_dapil(
     log=_log,
     on_result=None,
     should_stop=None,
+    antre_ocr=True,
 ):
     """
-    on_result(job, hasil, result_path) : dipanggil untuk setiap kecamatan yang
-                                         berhasil dibaca (mis. simpan ke DB).
-    should_stop()                      : return True untuk berhenti dengan rapi
-                                         setelah kecamatan yang sedang berjalan.
+    on_result(job, hasil, result_path) : dipanggil untuk tiap kecamatan yang terbaca.
+    should_stop()                      : True -> berhenti rapi setelah file berjalan.
+    antre_ocr=True                     : file scan diantrekan, di-OCR setelah file
+                                         bertext layer selesai.
     """
     if not _RUN_LOCK.acquire(blocking=False):
         raise RuntimeError("Sudah ada proses batch yang sedang berjalan.")
@@ -942,6 +922,7 @@ def run_dapil(
         return _run_dapil_locked(
             source, root_id, dapil_name, out_dir, checkpoint_path, dpi,
             retry_skipped, progress_callback, log, on_result, should_stop,
+            antre_ocr,
         )
     finally:
         _RUN_LOCK.release()
@@ -949,7 +930,7 @@ def run_dapil(
 
 def _run_dapil_locked(
     source, root_id, dapil_name, out_dir, checkpoint_path, dpi,
-    retry_skipped, progress_callback, log, on_result, should_stop,
+    retry_skipped, progress_callback, log, on_result, should_stop, antre_ocr,
 ):
     root_id = parse_drive_id(root_id) if not isinstance(source, LocalSource) else root_id
 
@@ -966,22 +947,35 @@ def _run_dapil_locked(
     stats = Counter()
     stopped = False
 
+    def stop_requested():
+        return should_stop is not None and should_stop()
+
+    # ---------------- Putaran 1: file cepat ----------------
     for index, job in enumerate(jobs, start=1):
         label = f"{job.kabupaten} / {job.kecamatan}"
 
-        if should_stop is not None and should_stop():
+        if stop_requested():
             stopped = True
             log("Dihentikan oleh pengguna. Kemajuan tersimpan di checkpoint.")
             break
 
-        if checkpoint.should_skip(job.key, retry_skipped=retry_skipped):
-            prev = checkpoint.get(job.key).get("status")
+        prev = checkpoint.status_of(job.key)
+
+        # Sudah antre dari proses sebelumnya: biarkan untuk putaran 2.
+        if prev == STATUS_QUEUE and antre_ocr:
+            stats[f"antre_{STATUS_QUEUE}"] += 1
+            log(f"[{index}/{total}] {label}: sudah antre OCR.")
+
+        elif checkpoint.should_skip(job.key, retry_skipped=retry_skipped):
             stats[f"lewat_{prev}"] += 1
             log(f"[{index}/{total}] {label}: sudah tercatat {prev}, dilewati.")
 
         else:
             log(f"[{index}/{total}] {label}: memproses ...")
-            row = process_job(source, job, out_dir, dpi=dpi, log=log, on_result=on_result)
+            row = process_job(
+                source, job, out_dir, dpi=dpi, log=log, on_result=on_result,
+                defer_ocr=antre_ocr,
+            )
             checkpoint.record(row)
 
             if job.file is not None:
@@ -997,6 +991,43 @@ def _run_dapil_locked(
             f"{index}/{total}: {label}",
         )
 
+    # ---------------- Putaran 2: antrean OCR ----------------
+    if antre_ocr and not stopped:
+        antrean = [
+            j for j in jobs
+            if j.file is not None and checkpoint.status_of(j.key) == STATUS_QUEUE
+        ]
+
+        if antrean:
+            log("")
+            log(f"== Putaran OCR: {len(antrean)} file tanpa text layer ==")
+
+        for k, job in enumerate(antrean, start=1):
+            label = f"{job.kabupaten} / {job.kecamatan}"
+
+            if stop_requested():
+                stopped = True
+                log("Dihentikan oleh pengguna. Sisa antrean OCR tetap tersimpan.")
+                break
+
+            log(f"[OCR {k}/{len(antrean)}] {label}: memproses ...")
+            row = process_job(
+                source, job, out_dir, dpi=dpi, log=log, on_result=on_result,
+                force_ocr=True,
+            )
+            checkpoint.record(row)
+
+            stats[STATUS_QUEUE] -= 1
+            stats[row["status"]] += 1
+            detail = f" ({row['alasan']})" if row.get("alasan") else ""
+            log(f"      -> {row['status']}{detail}")
+
+            engine.report_progress(
+                progress_callback,
+                0.99,
+                f"OCR antrean {k}/{len(antrean)}: {label}",
+            )
+
     dapil_dir = os.path.join(out_dir, safe_name(dapil_node.name))
     merged = None
 
@@ -1008,7 +1039,7 @@ def _run_dapil_locked(
         )
 
     log("Dihentikan." if stopped else "Selesai.")
-    log(f"Ringkasan: {dict(stats)}")
+    log(f"Ringkasan: { {k: v for k, v in stats.items() if v} }")
     if merged:
         log(f"Hasil gabungan dapil: {merged}")
     log(f"Checkpoint: {checkpoint_path}")
@@ -1042,13 +1073,10 @@ def diagnose_pdf(path, out=print):
     out(f"Halaman scan      : {info.get('halaman_scan', '?')}  (gambar menutup >= 40% halaman)")
     out(f"Total huruf       : {info.get('total_huruf', '?')}")
     out(f"Halaman penutup   : {info.get('halaman_penutup', '?')}  (terdeteksi dari teks)")
-    out(f"Keputusan         : {'LOLOS' if ok else 'DILEWATI'}")
+    out(f"Keputusan         : {'LOLOS text layer' if ok else 'TIDAK LOLOS (jalur OCR/antrean)'}")
 
     if not ok:
         out(f"Alasan            : {reason}")
-        if info.get("halaman_scan", 0) and info.get("halaman_bertext", 0) == 0:
-            out("Kesimpulan        : PDF ini hasil scan (gambar saja). Engine berbasis "
-                "text layer tidak bisa membacanya; perlu jalur OCR/AI vision.")
 
     try:
         doc = fitz.open(stream=data, filetype="pdf")
@@ -1067,19 +1095,21 @@ def main(argv=None):
     )
 
     src = ap.add_mutually_exclusive_group(required=False)
-    src.add_argument("--root", help="URL / ID folder ROOT di Google Drive (berisi folder dapil).")
+    src.add_argument("--root", help="URL / ID folder ROOT di Google Drive.")
     src.add_argument("--local", help="Folder lokal ROOT (berisi folder dapil).")
 
     ap.add_argument("--dapil", help="Nama dapil yang dikerjakan.")
-    ap.add_argument("--list-dapil", action="store_true", help="Tampilkan daftar dapil lalu keluar.")
-    ap.add_argument("--out", default="hasil_pemilu", help="Folder hasil (default: hasil_pemilu).")
-    ap.add_argument("--checkpoint", default="checkpoint_pemilu.xlsx", help="File checkpoint Excel.")
+    ap.add_argument("--list-dapil", action="store_true", help="Tampilkan daftar dapil.")
+    ap.add_argument("--out", default="hasil_pemilu")
+    ap.add_argument("--checkpoint", default="checkpoint_pemilu.xlsx")
     ap.add_argument("--credentials", default="credentials.json")
     ap.add_argument("--token", default="token.json")
     ap.add_argument("--service-account", default=None)
-    ap.add_argument("--retry-skipped", action="store_true", help="Coba lagi file berstatus DILEWATI.")
+    ap.add_argument("--retry-skipped", action="store_true", help="Coba lagi file DILEWATI.")
+    ap.add_argument("--tanpa-antrean", action="store_true",
+                    help="OCR file scan langsung di tempat (tanpa antrean).")
     ap.add_argument("--dpi", type=int, default=300)
-    ap.add_argument("--diagnose", metavar="PDF", help="Diagnosis satu file PDF lokal (tanpa Drive).")
+    ap.add_argument("--diagnose", metavar="PDF", help="Diagnosis satu PDF lokal.")
 
     args = ap.parse_args(argv)
 
@@ -1113,6 +1143,7 @@ def main(argv=None):
         checkpoint_path=args.checkpoint,
         dpi=args.dpi,
         retry_skipped=args.retry_skipped,
+        antre_ocr=not args.tanpa_antrean,
     )
     return 0
 

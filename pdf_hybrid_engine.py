@@ -17,7 +17,7 @@ Tujuan:
 - Export Excel.
 
 Catatan:
-- API key Gemini dibaca dari argumen atau GEMINI_API_KEY.
+- API key Gemini dibaca dari argumen atau GEMINI_API_KEYS.
 - Model dapat diganti melalui GEMINI_MODEL.
 - Jika angka tidak terbaca: null, bukan tebakan.
 """
@@ -1044,10 +1044,10 @@ def proses_pdf_batch_hybrid(
       raw: [...]
     }
     """
-    api_key = api_key or os.getenv("GEMINI_API_KEY")
-
+    _keys = [k.strip() for k in os.getenv("GEMINI_API_KEYS", "").split(",") if k.strip()]
+    api_key = api_key or (_keys[0] if _keys else None)
     if not api_key:
-        raise ValueError("GEMINI_API_KEY belum tersedia.")
+        raise ValueError("GEMINI_API_KEYS belum tersedia.")
 
     page_count = get_pdf_page_count(file_bytes)
     records = []
