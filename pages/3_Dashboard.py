@@ -108,46 +108,72 @@ if pdf_files.empty:
 
 st.subheader("File PDF Tersimpan")
 
-st.caption(
-    "PDF yang sudah diproses di Pemindai Data tersimpan di sistem. "
-    "Pilih file untuk melihat kembali hasil pembacaannya tanpa upload ulang."
+def _bagian(nama):
+    p = str(nama).split("__")
+    if len(p) >= 4:
+        return p[0].strip(), p[1].strip(), p[2].strip()
+    return "(Unggahan manual)", "-", "-"
+
+pdf_files = pdf_files.copy()
+pdf_files[["_dapil", "_kab", "_kec"]] = pdf_files["nama_file_asal"].apply(
+    lambda n: pd.Series(_bagian(n))
 )
 
-selected_file = st.session_state.get("file_terpilih_dashboard")
+f1, f2, f3 = st.columns(3)
 
-for idx, row in pdf_files.iterrows():
-    file_name = str(row["nama_file_asal"])
-    is_selected = file_name == selected_file
+with f1:
+    dapil_opsi = ["Semua"] + sorted(pdf_files["_dapil"].unique())
+    pil_dapil = st.selectbox("Dapil", dapil_opsi, key="dash_f_dapil")
 
-    c1, c2, c3, c4 = st.columns([4.5, 2.5, 2, 2])
+df_f = pdf_files if pil_dapil == "Semua" else pdf_files[pdf_files["_dapil"] == pil_dapil]
 
-    with c1:
-        st.write(file_name)
+with f2:
+    kab_opsi = ["Semua"] + sorted(df_f["_kab"].unique())
+    pil_kab = st.selectbox("Kabupaten/Kota", kab_opsi, key="dash_f_kab")
 
-    with c2:
-        if bool(row.get("hasil_tersimpan", False)):
-            st.write("Hasil tersimpan")
-        else:
-            st.write("Data database")
+df_f = df_f if pil_kab == "Semua" else df_f[df_f["_kab"] == pil_kab]
 
-    with c3:
-        if is_selected:
-            st.button(
-                "Sedang dilihat",
-                key=f"selected_{idx}_{file_name}",
-                disabled=True,
-                use_container_width=True,
-            )
-        else:
-            if st.button(
-                "Lihat Hasil",
-                key=f"view_{idx}_{file_name}",
-                type="primary",
-                use_container_width=True,
-            ):
-                st.session_state["file_terpilih_dashboard"] = file_name
-                st.rerun()
+with f3:
+    kec_opsi = ["Semua"] + sorted(df_f["_kec"].unique())
+    pil_kec = st.selectbox("Kecamatan", kec_opsi, key="dash_f_kec")
 
+df_f = df_f if pil_kec == "Semua" else df_f[df_f["_kec"] == pil_kec]
+
+st.caption(f"{len(df_f):,} file ditemukan")
+
+daftar = list(df_f["nama_file_asal"].astype(str))
+
+if not daftar:
+    st.info("Tidak ada file yang cocok dengan filter.")
+    st.stop()
+
+tersimpan = st.session_state.get("file_terpilih_dashboard")
+
+pilih = st.selectbox(
+    "Pilih file (bisa diketik untuk mencari)",
+    daftar,
+    index=daftar.index(tersimpan) if tersimpan in daftar else 0,
+    format_func=lambda n: " / ".join(_bagian(n)[1:]) + f"  |  {n.split('__')[-1][:30]}"
+    if n.count("__") >= 3 else n,
+    key="dash_pilih_file",
+)
+
+st.session_state["file_terpilih_dashboard"] = pilih
+
+if st.button("Hapus file ini", key="dash_hapus"):
+    delete_by_file(pilih)
+
+    arsip = SCAN_RESULTS_DIR / archive_name(pilih)
+    if arsip.exists():
+        arsip.unlink()
+
+    pdf_fisik = UPLOAD_DIR / pilih
+    if pdf_fisik.exists():
+        pdf_fisik.unlink()
+
+    st.session_state["file_terpilih_dashboard"] = None
+    st.rerun()
+    
     with c4:
         if st.button(
             "Hapus",
