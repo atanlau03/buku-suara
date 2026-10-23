@@ -4,15 +4,22 @@ gdrive_batch.py -- Pemrosesan batch PER DAPIL dari Google Drive.
 Struktur folder:
     ROOT/<Dapil>/<Kabupaten>/<Kecamatan>/<file PDF>.pdf
 
-Alur per file:
-  1. Ada text layer layak  -> baca langsung (cepat).
-  2. Tanpa text layer      -> status ANTRE_OCR, dikerjakan SETELAH semua file
-                              cepat selesai (tidak menahan file lain).
-  3. Giliran OCR           -> Tesseract; skor kualitas dihitung.
-                              Skor buruk -> (opsional) AI, atau DILEWATI.
+STATUS di checkpoint hanya dua:
+    BERHASIL   file terbaca (text layer atau OCR). Kolom alasan = catatan.
+    GAGAL      file tidak terbaca. Kolom alasan diawali jenis kegagalan:
+                 [ANTRE_OCR]      tanpa text layer, menunggu giliran OCR
+                 [DILEWATI]       tidak terbaca (scan/OCR buruk/format belum dikenali)
+                 [ERROR]          gagal unduh / engine error
+                 [TIDAK_ADA_PDF]  folder kecamatan tidak berisi PDF
+    ULANG      isi manual di Excel untuk memaksa satu baris diproses ulang.
 
-STATUS checkpoint:
-    SELESAI, DILEWATI, ERROR, TIDAK_ADA_PDF, ULANG, ANTRE_OCR
+Jenis di awalan alasan dipakai kode untuk memutuskan file mana yang diulang
+(antrean OCR, "coba lagi DILEWATI", ERROR otomatis diulang). Jangan hapus awalan [..].
+
+Alur per file:
+  1. Ada text layer layak          -> dibaca langsung.
+  2. Ada teks tapi format belum dikenali -> tetap dibaca engine (tanpa antre OCR).
+  3. Tanpa text layer (scan)       -> [ANTRE_OCR], di-OCR setelah semua file cepat selesai.
 
 Pemakaian:
     python gdrive_batch.py --root "<URL/ID>" --list-dapil
@@ -73,12 +80,19 @@ DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
 SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 
-STATUS_DONE = "SELESAI"
+# Status yang tersimpan di kolom "status" checkpoint:
+STATUS_OK = "BERHASIL"
+STATUS_FAIL = "GAGAL"
+STATUS_RETRY = "ULANG"
+
+# Jenis internal (dipakai kode; untuk GAGAL disimpan sebagai awalan alasan):
+STATUS_DONE = "SELESAI"        # = BERHASIL
 STATUS_SKIP = "DILEWATI"
 STATUS_ERROR = "ERROR"
 STATUS_EMPTY = "TIDAK_ADA_PDF"
-STATUS_RETRY = "ULANG"
 STATUS_QUEUE = "ANTRE_OCR"
+
+JENIS_GAGAL = {STATUS_SKIP, STATUS_ERROR, STATUS_EMPTY, STATUS_QUEUE}
 
 CHECKPOINT_COLUMNS = [
     "dapil", "kabupaten", "kecamatan", "nama_file", "file_id",
@@ -94,7 +108,7 @@ RESULT_SHEET_ORDER = [
     "gabungan_dashboard",
 ]
 
-# PDF tanpa text layer dengan halaman lebih banyak dari ini langsung DILEWATI.
+# PDF tanpa text layer dengan halaman lebih banyak dari ini langsung GAGAL [DILEWATI].
 MAX_HALAMAN_OCR = 500
 
 # Skor OCR (persen desa yang lolos validasi) di bawah ini dianggap buruk.
@@ -221,9 +235,8 @@ class DriveSource:
                 else:
                     if not os.path.exists(credentials_file):
                         raise FileNotFoundError(
-                            f"{credentials_file} tidak ditemukan. Lihat bagian "
-                            "SETUP GOOGLE DRIVE (pip install google-api-python-client "
-                            "google-auth-oauthlib google-auth-httplib2)."
+                            f"{credentials_file} tidak ditemukan. Buat kredensial "
+                            "OAuth Google Drive (lihat dokumentasi Google Cloud)."
                         )
                     flow = InstalledAppFlow.from_client_secrets_file(
                         credentials_file, DRIVE_SCOPES
@@ -481,6 +494,42 @@ def check_text_layer(pdf_bytes, min_chars=100, min_text_ratio=0.5):
 
 
 # ============================================================
+# STATUS: BERHASIL / GAGAL  (+ jenis kegagalan di awalan alasan)
+# ============================================================
+
+_TAG_RE = re.compile(r"^\[([A-Z_]+)\]\s*")
+
+
+def jenis_of(status, alasan):
+    """
+    Kembalikan jenis internal: SELESAI, DILEWATI, ERROR, TIDAK_ADA_PDF,
+    ANTRE_OCR, atau ULANG. Mengerti baris format lama (SELESAI/DILEWATI/...)
+    maupun format baru (BERHASIL/GAGAL + awalan [..] pada alasan).
+    """
+    s = _norm(status)
+
+    if s in (STATUS_OK, STATUS_DONE):
+        return STATUS_DONE
+
+    if s == STATUS_RETRY:
+        return STATUS_RETRY
+
+    m = _TAG_RE.match(str(alasan or ""))
+    if m and m.group(1) in JENIS_GAGAL:
+        return m.group(1)
+
+    if s in JENIS_GAGAL:      # baris lama sebelum dikonversi
+        return s
+
+    return STATUS_SKIP        # GAGAL tanpa awalan
+
+
+def alasan_tanpa_tag(alasan):
+    """Alasan tanpa awalan [JENIS]."""
+    return _TAG_RE.sub("", str(alasan or "")).strip()
+
+
+# ============================================================
 # CHECKPOINT (EXCEL)
 # ============================================================
 
@@ -498,8 +547,8 @@ def _autofit(ws, max_width=60):
 class Checkpoint:
     """
     File Excel yang mencatat status setiap file kecamatan.
-    Sheet "checkpoint"   : semua baris.
-    Sheet "sulit_dibaca" : DILEWATI + ERROR.
+    Sheet "checkpoint"   : semua baris (status BERHASIL / GAGAL).
+    Sheet "sulit_dibaca" : baris GAGAL.
     """
 
     def __init__(self, path, log=_log):
@@ -507,6 +556,23 @@ class Checkpoint:
         self.log = log
         self.rows = {}
         self._load()
+
+    @staticmethod
+    def _normalisasi(rec):
+        """Ubah baris format lama (SELESAI/DILEWATI/...) ke BERHASIL/GAGAL."""
+        jenis = jenis_of(rec.get("status"), rec.get("alasan"))
+        alasan = alasan_tanpa_tag(rec.get("alasan"))
+
+        if jenis == STATUS_DONE:
+            rec["status"] = STATUS_OK
+            rec["alasan"] = alasan or None
+        elif jenis == STATUS_RETRY:
+            rec["status"] = STATUS_RETRY
+        else:
+            rec["status"] = STATUS_FAIL
+            rec["alasan"] = f"[{jenis}] {alasan}".strip()
+
+        return rec
 
     def _load(self):
         if not os.path.exists(self.path):
@@ -525,26 +591,28 @@ class Checkpoint:
         for rec in df.to_dict("records"):
             key = rec.get("file_id")
             if key:
-                rec["status"] = _norm(rec.get("status"))
-                self.rows[key] = rec
+                self.rows[key] = self._normalisasi(rec)
 
     def get(self, key):
         return self.rows.get(key)
 
     def status_of(self, key):
+        """Jenis internal baris (SELESAI/DILEWATI/ERROR/ANTRE_OCR/...)."""
         rec = self.rows.get(key)
-        return rec.get("status") if rec else None
+        if not rec:
+            return None
+        return jenis_of(rec.get("status"), rec.get("alasan"))
 
     def drop(self, key):
         self.rows.pop(key, None)
 
     def should_skip(self, key, retry_skipped=False):
-        status = self.status_of(key)
-        if not status:
+        jenis = self.status_of(key)
+        if not jenis:
             return False
-        if status == STATUS_DONE:
+        if jenis == STATUS_DONE:
             return True
-        if status == STATUS_SKIP and not retry_skipped:
+        if jenis == STATUS_SKIP and not retry_skipped:
             return True
         # ERROR, ULANG, ANTRE_OCR, TIDAK_ADA_PDF -> dikerjakan
         return False
@@ -559,7 +627,7 @@ class Checkpoint:
             ["dapil", "kabupaten", "kecamatan", "nama_file"],
             kind="stable", na_position="last",
         )
-        hard = df[df["status"].isin([STATUS_SKIP, STATUS_ERROR])]
+        hard = df[df["status"] == STATUS_FAIL]
 
         tmp = (
             self.path[:-5] + ".tmp.xlsx"
@@ -655,7 +723,7 @@ def _write_result(hasil, meta, path):
 
 
 def _isi_wilayah(hasil, job):
-    """Lengkapi dapil/kab_kota/kecamatan yang kosong dari nama folder Drive."""
+    """Lengkapi dapil/kab_kota/kecamatan yang kosong/tidak bermakna dari nama folder Drive."""
     kosong = {"", "-", "none", "nan"}
 
     for sheet in ("tps", "parties", "gabungan_dashboard", "db"):
@@ -672,7 +740,10 @@ def _isi_wilayah(hasil, job):
             if col in df.columns:
                 df[col] = df[col].apply(
                     lambda v, n=nilai: n
-                    if v is None or pd.isna(v) or str(v).strip().lower() in kosong
+                    if v is None
+                    or pd.isna(v)
+                    or str(v).strip().lower() in kosong
+                    or not any(ch.isalpha() for ch in str(v))
                     else v
                 )
 
@@ -682,8 +753,8 @@ def process_job(
     force_ocr=False, defer_ocr=False,
 ):
     """
-    defer_ocr=True : file tanpa text layer TIDAK di-OCR sekarang, tetapi dicatat
-                     ANTRE_OCR supaya file lain tidak menunggu.
+    defer_ocr=True : file tanpa text layer TIDAK di-OCR sekarang, dicatat
+                     [ANTRE_OCR] supaya file lain tidak menunggu.
     force_ocr=True : giliran OCR (dari antrean).
     """
     started = time.time()
@@ -699,8 +770,13 @@ def process_job(
     )
 
     def finish(status, reason=""):
-        row["status"] = status
-        row["alasan"] = reason
+        """status = jenis internal (STATUS_DONE/SKIP/ERROR/EMPTY/QUEUE)."""
+        if status == STATUS_DONE:
+            row["status"] = STATUS_OK
+            row["alasan"] = reason
+        else:
+            row["status"] = STATUS_FAIL
+            row["alasan"] = f"[{status}] {reason}"
         row["durasi_detik"] = round(time.time() - started, 1)
         return row
 
@@ -726,22 +802,27 @@ def process_job(
         if not info.get("halaman"):
             return finish(STATUS_SKIP, reason)
 
-        # Terlalu panjang: OCR terlalu lama.
-        if info["halaman"] > MAX_HALAMAN_OCR:
-            return finish(
-                STATUS_SKIP,
-                f"{reason}; {info['halaman']} halaman, melebihi batas OCR ({MAX_HALAMAN_OCR})",
-            )
+        punya_teks = info["halaman_bertext"] / info["halaman"] >= 0.5
 
-        # Masuk antrean: dikerjakan setelah semua file bertext layer selesai.
-        if defer_ocr and not force_ocr:
-            return finish(
-                STATUS_QUEUE,
-                f"{reason}; menunggu antrean OCR (dikerjakan setelah file bertext layer)",
-            )
+        if punya_teks:
+            # Teks ada, hanya format penutup belum dikenali: engine tetap dicoba.
+            log(f"      ! {reason} -> teks ada, engine tetap dicoba (tanpa antre OCR)")
+        else:
+            if info["halaman"] > MAX_HALAMAN_OCR:
+                return finish(
+                    STATUS_SKIP,
+                    f"{reason}; {info['halaman']} halaman, melebihi batas OCR ({MAX_HALAMAN_OCR})",
+                )
 
-        dipaksa_ocr = True
-        log(f"      ! {reason} -> dicoba lewat OCR")
+            # Masuk antrean: dikerjakan setelah semua file bertext layer selesai.
+            if defer_ocr and not force_ocr:
+                return finish(
+                    STATUS_QUEUE,
+                    f"{reason}; menunggu antrean OCR (dikerjakan setelah file bertext layer)",
+                )
+
+            dipaksa_ocr = True
+            log(f"      ! {reason} -> dicoba lewat OCR")
 
     try:
         hasil = engine.process_pdf_local_engine(
@@ -961,9 +1042,14 @@ def _run_dapil_locked(
 
         prev = checkpoint.status_of(job.key)
 
-        # Sudah antre dari proses sebelumnya: biarkan untuk putaran 2.
-        if prev == STATUS_QUEUE and antre_ocr:
-            stats[f"antre_{STATUS_QUEUE}"] += 1
+        # Antre OCR murni (tanpa text layer): biarkan untuk putaran 2.
+        # Baris antre yang sebenarnya punya teks diproses ulang sekarang.
+        if (
+            prev == STATUS_QUEUE
+            and antre_ocr
+            and "Text layer minim" in str((checkpoint.get(job.key) or {}).get("alasan", ""))
+        ):
+            stats[STATUS_QUEUE] += 1
             log(f"[{index}/{total}] {label}: sudah antre OCR.")
 
         elif checkpoint.should_skip(job.key, retry_skipped=retry_skipped):
@@ -981,9 +1067,10 @@ def _run_dapil_locked(
             if job.file is not None:
                 checkpoint.drop(f"EMPTY::{job.kecamatan_folder_id}")
 
-            stats[row["status"]] += 1
-            detail = f" ({row['alasan']})" if row.get("alasan") else ""
-            log(f"      -> {row['status']}{detail}")
+            jenis = jenis_of(row["status"], row["alasan"])
+            stats[jenis] += 1
+            detail = f" ({alasan_tanpa_tag(row['alasan'])})" if row.get("alasan") else ""
+            log(f"      -> {row['status']} [{jenis}]{detail}")
 
         engine.report_progress(
             progress_callback,
@@ -1018,9 +1105,10 @@ def _run_dapil_locked(
             checkpoint.record(row)
 
             stats[STATUS_QUEUE] -= 1
-            stats[row["status"]] += 1
-            detail = f" ({row['alasan']})" if row.get("alasan") else ""
-            log(f"      -> {row['status']}{detail}")
+            jenis = jenis_of(row["status"], row["alasan"])
+            stats[jenis] += 1
+            detail = f" ({alasan_tanpa_tag(row['alasan'])})" if row.get("alasan") else ""
+            log(f"      -> {row['status']} [{jenis}]{detail}")
 
             engine.report_progress(
                 progress_callback,
@@ -1060,7 +1148,7 @@ def _run_dapil_locked(
 # ============================================================
 
 def diagnose_pdf(path, out=print):
-    """Diagnosis satu PDF lokal: kenapa ia lolos / dilewati."""
+    """Diagnosis satu PDF lokal: kenapa ia lolos / tidak lolos text layer."""
     with open(path, "rb") as f:
         data = f.read()
 
@@ -1073,7 +1161,7 @@ def diagnose_pdf(path, out=print):
     out(f"Halaman scan      : {info.get('halaman_scan', '?')}  (gambar menutup >= 40% halaman)")
     out(f"Total huruf       : {info.get('total_huruf', '?')}")
     out(f"Halaman penutup   : {info.get('halaman_penutup', '?')}  (terdeteksi dari teks)")
-    out(f"Keputusan         : {'LOLOS text layer' if ok else 'TIDAK LOLOS (jalur OCR/antrean)'}")
+    out(f"Keputusan         : {'LOLOS text layer' if ok else 'TIDAK LOLOS (jalur engine/antrean)'}")
 
     if not ok:
         out(f"Alasan            : {reason}")
@@ -1105,7 +1193,7 @@ def main(argv=None):
     ap.add_argument("--credentials", default="credentials.json")
     ap.add_argument("--token", default="token.json")
     ap.add_argument("--service-account", default=None)
-    ap.add_argument("--retry-skipped", action="store_true", help="Coba lagi file DILEWATI.")
+    ap.add_argument("--retry-skipped", action="store_true", help="Coba lagi file [DILEWATI].")
     ap.add_argument("--tanpa-antrean", action="store_true",
                     help="OCR file scan langsung di tempat (tanpa antrean).")
     ap.add_argument("--dpi", type=int, default=300)

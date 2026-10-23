@@ -175,6 +175,18 @@ PARTY_NAMES = {
 }
 
 
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Tiap proses Tesseract cukup 1 thread; paralelismenya kita atur sendiri
+# lewat pool di bawah, supaya tidak berebut core.
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+
+OCR_WORKERS = max(1, min(8, (os.cpu_count() or 2) - 1))
+
+# PyMuPDF tidak aman dipakai bersamaan dari banyak thread.
+_DOC_LOCK = threading.Lock()
+
 # ============================================================
 # TESSERACT
 # ============================================================
@@ -232,23 +244,16 @@ def render_page(doc, page_index, dpi=300):
 
     scale = dpi / 72.0
 
-    matrix = fitz.Matrix(
-        scale,
-        scale
-    )
-
     pix = page.get_pixmap(
-        matrix=matrix,
+        matrix=fitz.Matrix(scale, scale),
         alpha=False
     )
 
-    image = Image.open(
-        io.BytesIO(
-            pix.tobytes("png")
-        )
-    ).convert("RGB")
-
-    return image
+    return Image.frombytes(
+        "RGB",
+        [pix.width, pix.height],
+        pix.samples
+    )
 
 
 # ============================================================
@@ -293,47 +298,43 @@ def ocr_page(
     page_index,
     dpi=300
 ):
-    page = doc.load_page(
-        page_index
-    )
+    # Bagian yang menyentuh objek PDF dikunci; OCR-nya sendiri tidak.
+    with _DOC_LOCK:
+        page = doc.load_page(page_index)
 
-    text_layer = page.get_text(
-        "text"
-    ) or ""
+        text_layer = (
+            page.get_text("text") or ""
+        ).strip()
 
-    text_layer = text_layer.strip()
+        if len(text_layer) >= 100:
+            return text_layer
 
-    if len(text_layer) >= 100:
-        return text_layer
+        if TESSERACT_PATH is None:
+            return text_layer
 
-    if TESSERACT_PATH is None:
-        return text_layer
-
-    image = render_page(
-        doc,
-        page_index,
-        dpi=dpi
-    )
-
-    texts = []
-
-    for psm in (6, 11):
-        txt = ocr_image(
-            image,
-            psm=psm
+        image = render_page(
+            doc,
+            page_index,
+            dpi=dpi
         )
 
-        if txt:
-            texts.append(txt)
+    text = ocr_image(image, psm=6)
 
-    if not texts:
+    # psm 11 (sparse) lambat -> hanya dicoba kalau psm 6 hasilnya tipis.
+    if len(text.strip()) < 100:
+        alt = ocr_image(image, psm=11)
+
+        if len(alt) > len(text):
+            text = alt
+
+    return text or text_layer
+
+
+def _safe_ocr_page(doc, page_index, dpi):
+    try:
+        return ocr_page(doc, page_index, dpi=dpi)
+    except Exception:
         return ""
-
-    return max(
-        texts,
-        key=len
-    )
-
 
 # ============================================================
 # CALLBACK PROGRESS
@@ -545,7 +546,7 @@ def is_closing_page(text):
         and has_valid
         and has_invalid
         and has_total
-        and tps_count >= 2
+        and tps_count >= 1
     )
 
 
@@ -2672,40 +2673,40 @@ def process_pdf_local_engine(
     # BACA SEMUA HALAMAN
     # ========================================================
 
-    page_texts = []
+    page_texts = [""] * total_pages
 
-    for page_index in range(
-        total_pages
-    ):
+    finished_pages = 0
 
-        try:
-            text = ocr_page(
+    with ThreadPoolExecutor(
+        max_workers=OCR_WORKERS
+    ) as pool:
+
+        futures = {
+            pool.submit(
+                _safe_ocr_page,
                 doc,
                 page_index,
-                dpi=180
+                180
+            ): page_index
+            for page_index in range(total_pages)
+        }
+
+        for future in as_completed(futures):
+
+            page_index = futures[future]
+
+            page_texts[page_index] = normalize_text(
+                future.result()
             )
 
-        except Exception:
-            text = ""
+            finished_pages += 1
 
-        page_texts.append(
-            normalize_text(
-                text
-            )
-        )
-
-        if progress_callback:
-
-            report_progress(
-                progress_callback,
-                (
-                    (page_index + 1)
-                    / max(total_pages, 1)
-                    * 0.35
-                ),
-                f"Membaca halaman {page_index + 1}/{total_pages}"
-            )
-
+            if progress_callback:
+                report_progress(
+                    progress_callback,
+                    finished_pages / max(total_pages, 1) * 0.35,
+                    f"Membaca halaman {finished_pages}/{total_pages}"
+                )
     # ========================================================
     # TAHAP 2
     # CARI HALAMAN AKHIR DESA
@@ -2764,6 +2765,32 @@ def process_pdf_local_engine(
     # BACA HALAMAN AKHIR DESA
     # ========================================================
 
+       # ========================================================
+    # TAHAP 4
+    # BACA HALAMAN AKHIR DESA
+    # ========================================================
+
+    # OCR resolusi tinggi semua halaman penutup sekaligus, hasilnya
+    # disimpan supaya tidak diulang di Tahap 4 maupun Tahap 5.
+    closing_hi_cache = {}
+
+    with ThreadPoolExecutor(
+        max_workers=OCR_WORKERS
+    ) as pool:
+
+        futures = {
+            pool.submit(
+                _safe_ocr_page,
+                doc,
+                block["end_page"],
+                dpi_val
+            ): block["end_page"]
+            for block in blocks
+        }
+
+        for future in as_completed(futures):
+            closing_hi_cache[futures[future]] = future.result()
+
     for block_index, block in enumerate(
         blocks
     ):
@@ -2776,29 +2803,13 @@ def process_pdf_local_engine(
             closing_page
         ]
 
-        # ----------------------------------------------------
-        # OCR ulang halaman akhir dengan DPI tinggi.
-        # ----------------------------------------------------
+        closing_text_high = closing_hi_cache.get(
+            closing_page,
+            ""
+        )
 
-        try:
-
-            closing_text_high = ocr_page(
-                doc,
-                closing_page,
-                dpi=dpi_val
-            )
-
-            if len(
-                closing_text_high
-            ) > len(
-                closing_text
-            ):
-                closing_text = (
-                    closing_text_high
-                )
-
-        except Exception:
-            pass
+        if len(closing_text_high) > len(closing_text):
+            closing_text = closing_text_high
 
         block[
             "closing_text"
@@ -2807,15 +2818,6 @@ def process_pdf_local_engine(
         closing_data = extract_closing_vote_data(
             closing_text
         )
-
-        # ----------------------------------------------------
-        # PERBAIKAN:
-        # Jika suara_sah / suara_tidak_sah gagal terbaca lengkap
-        # dari teks linear (umum terjadi pada desa dengan TPS
-        # banyak, karena tabel terpecah 2 kolom), lengkapi/perbaiki
-        # dengan OCR berbasis koordinat (image_to_data) yang kebal
-        # terhadap masalah urutan baca linear tersebut.
-        # ----------------------------------------------------
 
         closing_data = refine_closing_data_with_positional(
             doc,
@@ -2828,6 +2830,7 @@ def process_pdf_local_engine(
             "closing_data"
         ] = closing_data
 
+       
         # ----------------------------------------------------
         # WILAYAH
         # ----------------------------------------------------
@@ -2982,7 +2985,8 @@ def process_pdf_local_engine(
             # Jika halaman terlalu pendek / kosong,
             # baca ulang dengan DPI tinggi.
             # ------------------------------------------------
-
+            if page_index in closing_hi_cache:
+                text = closing_hi_cache[page_index] or text
             if len(text.strip()) < 80:
 
                 try:

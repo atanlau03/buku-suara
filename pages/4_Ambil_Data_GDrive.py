@@ -30,6 +30,7 @@ gdrive_batch.py diletakkan di folder proyek (sejajar dengan local_ocr_engine.py)
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -67,8 +68,6 @@ st.set_page_config(
 )
 
 
-
-
 # ============================================================
 # DATABASE + MODUL BATCH
 # ============================================================
@@ -81,6 +80,7 @@ from database import (
 from scan_archive import save_scan_result
 
 from gdrive_batch import (
+    Checkpoint,
     DriveSource,
     LocalSource,
     is_batch_running,
@@ -88,10 +88,13 @@ from gdrive_batch import (
     parse_drive_id,
     run_dapil,
     safe_name,
+    jenis_of,
+    alasan_tanpa_tag,
     STATUS_DONE,
     STATUS_SKIP,
     STATUS_ERROR,
     STATUS_EMPTY,
+    STATUS_QUEUE,
 )
 
 
@@ -116,14 +119,8 @@ XLSX_MIME = (
 
 
 # ============================================================
-# PAGE CONFIG
+# TEMA + HEADER
 # ============================================================
-from ui_theme import apply_theme, header
-
-st.set_page_config(
-    page_title="Buku Suara - Ambil Data dari Google Drive",
-    layout="wide",
-)
 
 apply_theme()
 
@@ -131,6 +128,8 @@ header(
     "Ambil Data dari Google Drive",
     "Drive → Dapil → Kabupaten → Kecamatan → OCR Lokal → Database",
 )
+
+
 # ============================================================
 # PENGATURAN PERMANEN
 #
@@ -258,7 +257,6 @@ if "gd_status" not in st.session_state:
 
 if "gd_notified" not in st.session_state:
     st.session_state["gd_notified"] = False
-
 
 
 # ============================================================
@@ -844,6 +842,39 @@ def normalize_rows(rows):
     return df
 
 
+def hasil_sederhana(status, alasan):
+    """Terjemahkan checkpoint menjadi (hasil, metode, keterangan)."""
+    jenis = jenis_of(status, alasan)
+    a = alasan_tanpa_tag(alasan)
+
+    if jenis == STATUS_DONE:
+        metode = "OCR" if a.startswith("Tanpa text layer") else "Text layer"
+        return "BERHASIL", metode, a
+
+    if jenis == STATUS_QUEUE:
+        return "GAGAL", "-", "Belum di-OCR (masih antre): tanpa text layer, menunggu giliran OCR"
+
+    if jenis == STATUS_EMPTY:
+        return "GAGAL", "-", "Folder tanpa PDF: " + (a or "folder kecamatan tidak berisi file PDF")
+
+    if jenis == STATUS_ERROR:
+        return "GAGAL", "-", "Error: " + (a or "tidak diketahui")
+
+    # DILEWATI
+    if a.startswith("Tanpa text layer; OCR"):
+        awal = "OCR gagal/buruk"
+    elif a.startswith("Text layer minim"):
+        awal = "Tanpa text layer (scan)"
+    else:
+        awal = "Format belum dikenali"
+
+    return "GAGAL", "-", f"{awal}: {a}" if a else awal
+
+
+def jenis_gagal(keterangan):
+    return str(keterangan).split(":", 1)[0].strip() or "Tidak diketahui"
+
+
 def show_columns(df, columns):
     return df[[c for c in columns if c in df.columns]]
 
@@ -871,6 +902,79 @@ def merged_path_for(dapil, group, fallback_out_dir):
     )
 
 
+def folder_hasil_dapil(dapil, group, fallback_out_dir):
+    """Folder hasil Excel milik satu dapil (hanya yang namanya cocok
+    dengan nama dapil, supaya tidak pernah menghapus folder lain)."""
+
+    nama = safe_name(dapil)
+
+    folders = {Path(fallback_out_dir) / nama}
+
+    if "file_hasil" in group.columns:
+
+        for value in group["file_hasil"].dropna():
+
+            value = str(value).strip()
+
+            if value:
+                folders.add(Path(value).parent.parent)
+
+    return sorted(
+        f for f in folders
+        if f.name == nama and f.is_dir()
+    )
+
+
+def hapus_dapil(dapil, checkpoint_file, fallback_out_dir):
+    """
+    Hapus satu dapil dari checkpoint dan hapus folder hasil Excel-nya.
+    Database dan arsip Dashboard TIDAK disentuh. File di Google Drive
+    tidak disentuh.
+    """
+
+    cp = Checkpoint(checkpoint_file)
+
+    keys = [
+        k for k, r in cp.rows.items()
+        if r.get("dapil") == dapil
+    ]
+
+    group = pd.DataFrame([cp.rows[k] for k in keys])
+
+    folders = folder_hasil_dapil(dapil, group, fallback_out_dir)
+
+    for k in keys:
+        cp.drop(k)
+
+    cp.save()
+
+    # Checkpoint.save() diam-diam menulis ke file cadangan bila file
+    # utama terkunci (mis. sedang dibuka di Excel). Pastikan benar-benar
+    # tersimpan sebelum menghapus folder hasil.
+    sisa = [
+        k for k, r in Checkpoint(checkpoint_file).rows.items()
+        if r.get("dapil") == dapil
+    ]
+
+    if sisa:
+        raise RuntimeError(
+            "File checkpoint tidak bisa ditulis (sedang dibuka di Excel?). "
+            "Tutup file itu lalu coba lagi. Folder hasil belum dihapus."
+        )
+
+    jumlah_file = 0
+
+    for folder in folders:
+        jumlah_file += sum(1 for _ in folder.rglob("*.xlsx"))
+        shutil.rmtree(folder)
+
+    return {
+        "baris": len(keys),
+        "folder": len(folders),
+        "file": jumlah_file,
+    }
+
+
 def summarize_history(checkpoint_df, fallback_out_dir):
 
     df = checkpoint_df.copy()
@@ -893,7 +997,18 @@ def summarize_history(checkpoint_df, fallback_out_dir):
 
     for dapil, group in df.groupby("dapil", dropna=True):
 
-        counts = group["status"].value_counts()
+        alasan_g = (
+            group["alasan"].fillna("")
+            if "alasan" in group.columns
+            else pd.Series("", index=group.index)
+        )
+
+        hasil_g = [
+            hasil_sederhana(st_, al_)[0]
+            for st_, al_ in zip(group["status"], alasan_g)
+        ]
+
+        n_ok = hasil_g.count("BERHASIL")
 
         merged = merged_path_for(dapil, group, fallback_out_dir)
 
@@ -901,10 +1016,8 @@ def summarize_history(checkpoint_df, fallback_out_dir):
             {
                 "dapil": dapil,
                 "kecamatan_total": len(group),
-                "selesai": int(counts.get(STATUS_DONE, 0)),
-                "dilewati": int(counts.get(STATUS_SKIP, 0)),
-                "error": int(counts.get(STATUS_ERROR, 0)),
-                "tanpa_pdf": int(counts.get(STATUS_EMPTY, 0)),
+                "berhasil": n_ok,
+                "gagal": len(group) - n_ok,
                 "perlu_dicek": int(group["_review"].sum()),
                 "terakhir_diproses": (
                     group["diproses_pada"].fillna("").max()
@@ -930,6 +1043,18 @@ def summarize_history(checkpoint_df, fallback_out_dir):
 def render_dapil_report(dapil, group, fallback_out_dir):
 
     tampil_df = normalize_rows(group.to_dict("records"))
+    rows_df = tampil_df
+
+    hasil_list = [
+        hasil_sederhana(s, a)
+        for s, a in zip(
+            rows_df["status"],
+            rows_df["alasan"] if "alasan" in rows_df.columns else [""] * len(rows_df),
+        )
+    ]
+    rows_df["hasil"] = [h[0] for h in hasil_list]
+    rows_df["metode"] = [h[1] for h in hasil_list]
+    rows_df["keterangan"] = [h[2] for h in hasil_list]
 
     counts = tampil_df["status"].value_counts()
 
@@ -942,18 +1067,31 @@ def render_dapil_report(dapil, group, fallback_out_dir):
         .gt(0)
     )
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    berhasil = rows_df[rows_df["hasil"] == "BERHASIL"]
+    gagal = rows_df[rows_df["hasil"] == "GAGAL"]
 
-    c1.metric("Kecamatan Terbaca", int(counts.get(STATUS_DONE, 0)))
-    c2.metric("Dilewati (text layer buruk)", int(counts.get(STATUS_SKIP, 0)))
-    c3.metric("Error", int(counts.get(STATUS_ERROR, 0)))
-    c4.metric("Folder Tanpa PDF", int(counts.get(STATUS_EMPTY, 0)))
-    c5.metric("Terbaca, Perlu Dicek", int(review_mask.sum()))
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Total Kecamatan", len(rows_df))
+    m2.metric("Berhasil", len(berhasil))
+    m3.metric("Gagal", len(gagal))
+    m4.metric("Berhasil via Text layer", int((berhasil["metode"] == "Text layer").sum()))
+    m5.metric("Berhasil via OCR", int((berhasil["metode"] == "OCR").sum()))
 
-
-    st.subheader(
-        "1. Status per Kecamatan"
+    st.caption(
+        f"Berhasil {len(berhasil):,} + Gagal {len(gagal):,} = {len(rows_df):,} "
+        "(sama dengan total kecamatan). Berhasil yang perlu dicek: "
+        f"{int(review_mask.sum()):,}."
     )
+
+    if not gagal.empty:
+        rincian = (
+            gagal["keterangan"].apply(jenis_gagal).value_counts()
+            .rename_axis("Penyebab gagal").reset_index(name="Jumlah")
+        )
+        st.markdown("**Rincian penyebab gagal**")
+        st.dataframe(rincian, use_container_width=True, hide_index=True)
+
+    st.subheader("1. Status per Kecamatan")
 
     st.dataframe(
         show_columns(
@@ -962,23 +1100,16 @@ def render_dapil_report(dapil, group, fallback_out_dir):
                 "kabupaten",
                 "kecamatan",
                 "nama_file",
-                "status",
-                "alasan",
-                "jumlah_halaman",
-                "jumlah_kelurahan",
-                "jumlah_tps",
-                "kelurahan_perlu_cek",
-                "diproses_pada",
+                "hasil",
+                "metode",
+                "keterangan",
             ],
         ),
         width="stretch",
         hide_index=True,
     )
 
-
-    hard = tampil_df[
-        tampil_df["status"].isin([STATUS_SKIP, STATUS_ERROR])
-    ]
+    hard = gagal
 
     if not hard.empty:
 
@@ -999,17 +1130,13 @@ def render_dapil_report(dapil, group, fallback_out_dir):
                     "kabupaten",
                     "kecamatan",
                     "nama_file",
-                    "status",
-                    "alasan",
+                    "keterangan",
                     "jumlah_halaman",
-                    "halaman_bertext",
-                    "halaman_scan",
                 ],
             ),
             width="stretch",
             hide_index=True,
         )
-
 
     check = tampil_df[review_mask]
 
@@ -1032,7 +1159,6 @@ def render_dapil_report(dapil, group, fallback_out_dir):
             width="stretch",
             hide_index=True,
         )
-
 
     st.subheader(
         "Hasil Tersimpan"
@@ -1082,7 +1208,6 @@ def render_dapil_report(dapil, group, fallback_out_dir):
         "(bila opsi simpan ke database aktif)."
     )
 
-
     if merged.exists() and st.checkbox(
         "Tampilkan pratinjau data hasil",
         key="gd_preview",
@@ -1131,6 +1256,18 @@ st.header(
     "Riwayat Dapil yang Sudah Diproses"
 )
 
+st.session_state.setdefault("gd_del_nonce", 0)
+
+_notice = st.session_state.pop("gd_hapus_notice", None)
+
+if _notice:
+    st.success(_notice)
+
+_notice_err = st.session_state.pop("gd_hapus_error", None)
+
+if _notice_err:
+    st.error(_notice_err)
+
 checkpoint_df = load_checkpoint_df(checkpoint_path)
 
 if checkpoint_df.empty or "dapil" not in checkpoint_df.columns:
@@ -1153,8 +1290,7 @@ else:
 
     if only_issue:
         shown = history[
-            (history["dilewati"] > 0)
-            | (history["error"] > 0)
+            (history["gagal"] > 0)
             | (history["perlu_dicek"] > 0)
         ]
 
@@ -1163,6 +1299,108 @@ else:
         use_container_width=True,
         hide_index=True,
     )
+
+    nonce = st.session_state["gd_del_nonce"]
+
+    with st.expander("Hapus dapil dari riwayat"):
+
+        dipilih = st.multiselect(
+            "Pilih dapil yang akan dihapus",
+            list(history["dapil"]),
+            key=f"gd_del_pick_{nonce}",
+            placeholder="Pilih satu atau beberapa dapil",
+        )
+
+        if not dipilih:
+
+            st.caption("Belum ada dapil yang dipilih.")
+
+        else:
+
+            ringkas = []
+
+            for nama in dipilih:
+                grup = checkpoint_df[checkpoint_df["dapil"] == nama]
+                folders = folder_hasil_dapil(nama, grup, out_dir)
+                n_file = sum(1 for f in folders for _ in f.rglob("*.xlsx"))
+                ringkas.append(
+                    f"- {nama}: {len(grup):,} catatan, {n_file:,} file Excel"
+                )
+
+            st.warning(
+                f"{len(dipilih)} dapil akan dihapus:\n"
+                + "\n".join(ringkas)
+            )
+
+            st.caption(
+                "Yang dihapus: catatan di file checkpoint dan folder hasil "
+                "Excel. Data di database dan arsip Dashboard TIDAK ikut "
+                "terhapus. File PDF di Google Drive tidak disentuh. Dapil "
+                "yang dihapus bisa diproses ulang dari awal."
+            )
+
+            sedang_proses = bool(
+                st.session_state["gd_status"].get("running")
+            ) or is_batch_running()
+
+            if sedang_proses:
+                st.info(
+                    "Penghapusan dinonaktifkan selama proses dapil berjalan."
+                )
+
+            yakin = st.checkbox(
+                "Saya mengerti dapil di atas akan dihapus dan tidak bisa "
+                "dikembalikan.",
+                key=f"gd_del_yakin_{nonce}_" + "|".join(dipilih),
+            )
+
+            if st.button(
+                f"Hapus {len(dipilih)} dapil",
+                type="primary",
+                disabled=sedang_proses or not yakin,
+                key=f"gd_del_btn_{nonce}_" + "|".join(dipilih),
+            ):
+
+                terhapus = []
+                gagal_hapus = []
+                total = {"baris": 0, "folder": 0, "file": 0}
+
+                for nama in dipilih:
+
+                    try:
+                        hasil_hapus = hapus_dapil(
+                            nama,
+                            checkpoint_path,
+                            out_dir,
+                        )
+
+                    except Exception as error:
+                        gagal_hapus.append(
+                            f"{nama} ({type(error).__name__}: {error})"
+                        )
+
+                    else:
+                        terhapus.append(nama)
+
+                        for kunci in total:
+                            total[kunci] += hasil_hapus[kunci]
+
+                if terhapus:
+                    st.session_state["gd_hapus_notice"] = (
+                        f"{len(terhapus)} dapil dihapus "
+                        f"({', '.join(terhapus)}): "
+                        f"{total['baris']:,} catatan checkpoint, "
+                        f"{total['folder']} folder, "
+                        f"{total['file']:,} file Excel."
+                    )
+
+                if gagal_hapus:
+                    st.session_state["gd_hapus_error"] = (
+                        "Gagal menghapus: " + "; ".join(gagal_hapus)
+                    )
+
+                st.session_state["gd_del_nonce"] = nonce + 1
+                st.rerun()
 
     options = list(history["dapil"])
 
